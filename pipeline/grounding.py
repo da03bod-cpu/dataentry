@@ -3,7 +3,12 @@
 The LLM is a candidate extractor, not the source of truth.  Every returned
 record must be supported by text extracted from the *current* upload.
 
-v6 adds a deterministic structure pass for report-style documents:
+v7 keeps the deterministic structure pass and adds conservative field cleanup:
+- reconstruct target_audience + delivery_method from wrapped RTL multi-column rows
+- prevent beneficiary_value from duplicating target_audience
+- keep all repairs bounded to the current item section
+
+v6 added a deterministic structure pass for report-style documents:
 - recover top-level Arabic section headings (programs)
 - recover repeated initiative/project headings from TOC + detail pages
 - preserve canonical heading names, including prefixes such as "مبادرة"
@@ -562,6 +567,212 @@ def _infer_simple_label_text(context: str, labels):
     return None
 
 
+
+# Generic lexical anchors used only to split wrapped RTL rows whose header contains
+# both "مكان التنفيذ" and "الفئة المستهدفة".  These are not entity names and are
+# intentionally broad so the logic stays document-agnostic.
+_PLACE_MARKERS = tuple(_norm(x) for x in (
+    "مقر", "موقع", "مكان", "فندق", "الفنادق", "مستشفى", "مسجد", "المسجد",
+    "مصلى", "مصليات", "المصليات", "ساحات", "الساحات", "المنطقة", "غرفة", "قاعة", "مركز", "المركز",
+    "المطار", "المطارات", "المحطة", "المحطات", "عن بعد", "الحملات", "التخصصي",
+))
+_AUDIENCE_MARKERS = tuple(_norm(x) for x in (
+    "ضيوف", "ضيفات", "الحاجات", "الحجاج", "المعتمرات", "الزائرات", "الرجال",
+    "النساء", "أطفال", "اطفال", "فتيات", "مشرفات", "المريضات", "المر يضات", "مر يضات",
+    "العاملون", "المهتمون", "المتطوعات", "المتطوعين", "حملات حجاج",
+    "حجاج الداخل", "الخارج", "الخار ج", "العرب",
+))
+
+
+def _strip_leading_metrics(raw: str) -> str:
+    """Remove volunteer/hour numeric cells that precede wrapped text values."""
+    s = unicodedata.normalize("NFKC", raw or "").translate(_DIGITS).strip()
+    # Two/three leading numeric cells are common in rows such as "12 116 الفنادق ...".
+    s = re.sub(r"^(?:(?:\d+(?:[.,]\d+)?)\s+){1,3}(?=[\u0600-\u06FF])", "", s)
+    return " ".join(s.split())
+
+
+def _word_marker_index(words, markers):
+    nwords = [_norm(w) for w in words]
+
+    def eq_token(word, marker):
+        if word == marker:
+            return True
+        # Arabic conjunction is often attached to the next cell fragment after OCR,
+        # e.g. "والزائرات" should match the marker "الزائرات".
+        return len(word) > 2 and word.startswith("و") and word[1:] == marker
+
+    best = None
+    for marker in markers:
+        mtoks = marker.split()
+        if not mtoks:
+            continue
+        for i in range(len(nwords) - len(mtoks) + 1):
+            if all(eq_token(nwords[i + k], mtoks[k]) for k in range(len(mtoks))):
+                cand = (i, len(mtoks))
+                if best is None or cand[0] < best[0] or (cand[0] == best[0] and cand[1] > best[1]):
+                    best = cand
+                break
+    return best
+
+
+def _dynamic_place_index(words, current_delivery: str | None):
+    if not current_delivery:
+        return None
+    d = _norm(current_delivery)
+    nw = [_norm(w) for w in words]
+    # "حملات الحج" is a location phrase, while "حملات حجاج ..." is an audience.
+    if _norm("حملات") in d and _norm("الحج") in nw:
+        return nw.index(_norm("الحج"))
+    return None
+
+
+def _dynamic_audience_index(words, current_target: str | None):
+    """Recognize a few common continuation tokens only when the target phrase needs them."""
+    if not current_target:
+        return None
+    t = _norm(current_target)
+    nw = [_norm(w) for w in words]
+    candidates = []
+    if any(x in t for x in (_norm("ضيوف"), _norm("ضيفات"))) and _norm("الرحمن") in nw:
+        candidates.append(nw.index(_norm("الرحمن")))
+    if _norm("البيت") in t and _norm("الحرام") in nw:
+        candidates.append(nw.index(_norm("الحرام")))
+    if any(x in t for x in (_norm("العاملون"), _norm("المهتمون"))):
+        for token in (_norm("بالقطاع"), _norm("القطاع"), _norm("الربحي")):
+            if token in nw:
+                candidates.append(nw.index(token))
+    if _norm("حجاج") in t:
+        for token in (_norm("الخارج"), _norm("الخار"), _norm("العرب")):
+            if token in nw:
+                candidates.append(nw.index(token))
+    return min(candidates) if candidates else None
+
+
+def _append_part(parts, text):
+    text = " ".join(str(text or "").split()).strip(" ،,;؛")
+    if text:
+        parts.append(text)
+
+
+def _join_parts(parts):
+    if not parts:
+        return None
+    # Preserve source wording while removing exact repeated chunks introduced by OCR wrapping.
+    out = []
+    seen = set()
+    for part in parts:
+        n = _norm(part)
+        if n and n not in seen:
+            out.append(part)
+            seen.add(n)
+    return " ".join(out)[:1000] if out else None
+
+
+def _infer_multicolumn_target_delivery(context: str):
+    """Recover target/delivery from wrapped RTL multi-column rows.
+
+    The routine activates only when the same header line contains both field labels,
+    then consumes the few lines immediately below that header.  It never searches
+    outside the current item context.
+    """
+    lines = context.splitlines()
+    norm_lines = [_norm(x) for x in lines]
+    target_labels = [_norm(x) for x in _TARGET_LABELS]
+    delivery_labels = [_norm(x) for x in _DELIVERY_LABELS]
+
+    header_idx = None
+    for i, n in enumerate(norm_lines):
+        if any(x and x in n for x in target_labels) and any(x and x in n for x in delivery_labels):
+            header_idx = i
+            break
+    if header_idx is None:
+        return None, None
+
+    target_parts, delivery_parts = [], []
+    unknown = []
+    all_hint_norms = [_norm(h) for h in _FIELD_HINTS]
+
+    for j in range(header_idx + 1, min(len(lines), header_idx + 7)):
+        raw = _strip_leading_metrics(lines[j])
+        n = _norm(raw)
+        if not n:
+            continue
+        if n == "التقرير" or re.fullmatch(r"ف\s*\d+", n):
+            break
+        if any(h in n for h in all_hint_norms):
+            break
+
+        words = raw.split()
+        place_hit = _word_marker_index(words, _PLACE_MARKERS)
+        audience_hit = _word_marker_index(words, _AUDIENCE_MARKERS)
+        dyn_place = _dynamic_place_index(words, _join_parts(delivery_parts))
+        if dyn_place is not None and (place_hit is None or dyn_place < place_hit[0]):
+            place_hit = (dyn_place, 1)
+        dyn_idx = _dynamic_audience_index(words, _join_parts(target_parts))
+        if dyn_idx is not None and (audience_hit is None or dyn_idx < audience_hit[0]):
+            audience_hit = (dyn_idx, 1)
+
+        if place_hit is not None and audience_hit is not None:
+            pi, _ = place_hit
+            ai, _ = audience_hit
+            if pi < ai:
+                _append_part(delivery_parts, " ".join(words[:ai]))
+                _append_part(target_parts, " ".join(words[ai:]))
+            elif ai < pi:
+                _append_part(target_parts, " ".join(words[:pi]))
+                _append_part(delivery_parts, " ".join(words[pi:]))
+            else:
+                # Same start is rare; prefer the more specific audience marker only if
+                # it is a known audience phrase such as "حملات حجاج".
+                if _norm(" ".join(words[ai:ai + audience_hit[1]])) in _AUDIENCE_MARKERS:
+                    _append_part(target_parts, raw)
+                else:
+                    _append_part(delivery_parts, raw)
+            continue
+
+        if audience_hit is not None:
+            # If an audience marker appears anywhere on an otherwise unsplit line,
+            # the whole phrase usually belongs to the target column.
+            _append_part(target_parts, raw)
+            continue
+        if place_hit is not None:
+            _append_part(delivery_parts, raw)
+            continue
+        unknown.append(raw)
+
+    # Conservative continuation handling for proper names / wrapped endings.
+    for raw in unknown:
+        n = _norm(raw)
+        current_target = _join_parts(target_parts) or ""
+        current_delivery = _join_parts(delivery_parts) or ""
+        if (_norm("الرحمن") in n and any(x in _norm(current_target) for x in (_norm("ضيوف"), _norm("ضيفات")))) \
+                or (_norm("الحرام") in n and _norm("البيت") in _norm(current_target)) \
+                or (_norm("القطاع") in n and any(x in _norm(current_target) for x in (_norm("العاملون"), _norm("المهتمون")))):
+            _append_part(target_parts, raw)
+        elif any(x in _norm(current_delivery) for x in (_norm("فندق"), _norm("مسجد"), _norm("مستشفى"), _norm("غرفة"), _norm("عن بعد"))):
+            _append_part(delivery_parts, raw)
+
+    return _join_parts(target_parts), _join_parts(delivery_parts)
+
+
+def _beneficiary_value_is_audience(value, target_audience) -> bool:
+    """Reject audience text accidentally copied into beneficiary_value."""
+    if not value:
+        return False
+    v = _norm(value)
+    t = _norm(target_audience)
+    if t and (v == t or _contains_token_phrase(t, v) or _contains_token_phrase(v, t)):
+        return True
+    words = v.split()
+    if not words:
+        return False
+    marker_tokens = set()
+    for marker in _AUDIENCE_MARKERS:
+        marker_tokens.update(marker.split())
+    # Strong audience terms at the start are enough to reject this semantic mix-up.
+    return words[0] in marker_tokens
+
 def ground_programs(programs, document: str):
     """Return only records supported by the current extracted document."""
     candidates, structured = _augment_from_structure(programs, document)
@@ -633,15 +844,29 @@ def ground_programs(programs, document: str):
                 item[key] = None
                 nulled += 1
 
-        # Conservative deterministic fill for simple label/value layouts.
-        if item.get("target_audience") is None:
+        # Deterministic fill for labelled layouts. First try the wrapped RTL
+        # multi-column parser, then fall back to one-column label/value extraction.
+        multi_target, multi_delivery = _infer_multicolumn_target_delivery(context)
+        if multi_target:
+            # Multi-column reconstruction is more specific than a partial model value.
+            item["target_audience"] = multi_target
+        elif item.get("target_audience") is None:
             item["target_audience"] = _infer_simple_label_text(context, _TARGET_LABELS)
-        if item.get("delivery_method") is None:
+
+        if multi_delivery:
+            item["delivery_method"] = multi_delivery
+        elif item.get("delivery_method") is None:
             item["delivery_method"] = _infer_simple_label_text(context, _DELIVERY_LABELS)
+
+        # beneficiary_value is the delivered benefit/service, never the audience.
+        # If the model copied the target group into this field, null it rather than guess.
+        if _beneficiary_value_is_audience(item.get("beneficiary_value"), item.get("target_audience")):
+            item["beneficiary_value"] = None
+            nulled += 1
 
         grounded.append(item)
 
-    log.info("grounding v6: structured=%s kept=%d dropped=%d nulled_fields=%d",
+    log.info("grounding v7: structured=%s kept=%d dropped=%d nulled_fields=%d",
              structured, len(grounded), dropped, nulled)
     return grounded, {
         "grounded_kept": len(grounded),

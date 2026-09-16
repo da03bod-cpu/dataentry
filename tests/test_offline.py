@@ -563,3 +563,71 @@ def test_v7_keeps_real_beneficiary_value_when_grounded_and_not_audience():
     out, _ = ground_programs(pl.clean_programs(candidate), doc)
     assert len(out) == 1
     assert out[0]["beneficiary_value"] == "وجبات جافة"
+
+
+def test_v82_notes_require_explicit_source_label():
+    from pipeline.grounding import ground_programs
+    doc = """دورة إدارة استراتيجية لحملة الحج
+دورة تدريبية مقدمة لمشرفات الحج
+الفئة المستهدفة مكان التنفيذ
+مشرفات اللجان الثقافية عن بعد
+"""
+    candidate = [{
+        "type": "project", "name": "دورة إدارة استراتيجية لحملة الحج",
+        "notes": "عن بعد", "target_audience": "مشرفات اللجان الثقافية",
+        "delivery_method": "عن بعد",
+    }]
+    out, _ = ground_programs(pl.clean_programs(candidate), doc)
+    assert out[0]["notes"] is None
+
+
+def test_v82_keeps_explicit_notes_label():
+    from pipeline.grounding import ground_programs
+    doc = """مشروع سقيا الماء
+توزيع عبوات الماء
+ملاحظات
+ينفذ في موسم الحج
+"""
+    candidate = [{"type": "project", "name": "مشروع سقيا الماء", "notes": "ينفذ في موسم الحج"}]
+    out, _ = ground_programs(pl.clean_programs(candidate), doc)
+    assert out[0]["notes"] == "ينفذ في موسم الحج"
+
+
+def test_v82_cleans_obvious_arabic_ocr_splits_after_grounding():
+    from pipeline.grounding import ground_programs
+    doc = """مبادرة ُسلوان
+ز يارة المر يضات من ضيفات الرحمن، وتقديم الهدايا لهن
+الفئة المستهدفة
+المر يضات من ضيفات الرحمن
+"""
+    candidate = [{
+        "type": "project", "name": "مبادرة ُسلوان",
+        "description": "ز يارة المر يضات من ضيفات الرحمن، وتقديم الهدايا لهن",
+        "target_audience": "المر يضات من ضيفات الرحمن",
+    }]
+    out, _ = ground_programs(pl.clean_programs(candidate), doc)
+    assert out[0]["name"] == "مبادرة سلوان"
+    assert out[0]["description"].startswith("زيارة المريضات")
+    assert out[0]["target_audience"] == "المريضات من ضيفات الرحمن"
+
+
+def test_v82_supervisor_wrap_goes_to_target_not_delivery_or_notes():
+    from pipeline.grounding import ground_programs
+    doc = """دورة إدارة استراتيجية لحملة الحج
+دورة تدريبية مقدمة لمشرفات الحج
+عدد المستفيدين
+67
+عدد المتطوعين ساعات التطوع مكان التنفيذ الفئة المستهدفة
+مشرفات اللجان الثقافية
+5 60 عن بعد
+في حملات الحج
+"""
+    candidate = [{
+        "type": "project", "name": "دورة إدارة استراتيجية لحملة الحج",
+        "beneficiaries_count": 67, "delivery_method": "عن بعد",
+        "target_audience": "مشرفات اللجان الثقافية", "notes": "في حملات الحج",
+    }]
+    out, _ = ground_programs(pl.clean_programs(candidate), doc)
+    assert out[0]["target_audience"] == "مشرفات اللجان الثقافية في حملات الحج"
+    assert out[0]["delivery_method"] == "عن بعد"
+    assert out[0]["notes"] is None

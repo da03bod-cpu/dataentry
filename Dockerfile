@@ -19,7 +19,7 @@ RUN (apt-get update && apt-get install -y --no-install-recommends antiword && rm
 # this step (cudnn/cublas conflicts), rebuild with a matching pair, e.g.
 #   --build-arg TORCH_VERSION=2.7.1 --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu126
 ARG TORCH_VERSION=2.6.0
-ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu126
 RUN python -m pip install --no-cache-dir "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX}"
 
 # This extraction worker intentionally does NOT bake or load any fine-tuned LoRA.
@@ -39,9 +39,8 @@ COPY config.py handler.py ./
 COPY pipeline/ ./pipeline/
 
 # Fail the BUILD (not the first request) if the Python stack is broken.
-RUN python -c "import torch, transformers, peft, accelerate, docx, openpyxl, xlrd, pymupdf, json_repair, runpod; \
-import handler; print('torch', torch.__version__, '| transformers', transformers.__version__, '| peft', peft.__version__)" && \
-    (python -c "import paddle, paddleocr; print('paddle', paddle.__version__)" \
-     || echo "WARNING: paddle/paddleocr import failed; scanned PDFs will not work")
+RUN python -c "import torch, transformers, accelerate, docx, openpyxl, xlrd, pymupdf, json_repair, runpod; \
+import handler; print('torch', torch.__version__, '| transformers', transformers.__version__)" && \
+    python -c "import paddle, paddleocr; print('paddle', paddle.__version__)"
 
 CMD ["python", "-u", "handler.py"]

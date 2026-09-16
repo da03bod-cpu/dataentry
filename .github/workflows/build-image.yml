@@ -36,5 +36,5 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/dataentry:v8.2
+            ghcr.io/${{ github.repository_owner }}/dataentry:v8.3
             ghcr.io/${{ github.repository_owner }}/dataentry:latest

@@ -766,20 +766,25 @@ def _infer_multicolumn_target_delivery(context: str):
 # splits, not semantic rewrites. Grounding still happens against the raw source
 # before this cleanup is applied.
 _OCR_DISPLAY_FIXES = (
-    (re.compile(r"(?<!\w)توز\s+يع(?!\w)"), "توزيع"),
-    (re.compile(r"(?<!\w)ز\s+يارة(?!\w)"), "زيارة"),
-    (re.compile(r"(?<!\w)تعز\s+يز(?!\w)"), "تعزيز"),
-    (re.compile(r"(?<!\w)تدر\s+يب(?!\w)"), "تدريب"),
-    (re.compile(r"(?<!\w)المعتمر\s+ين(?!\w)"), "المعتمرين"),
-    (re.compile(r"(?<!\w)الخار\s+ج(?!\w)"), "الخارج"),
-    (re.compile(r"(?<!\w)المركز\s+ية(?!\w)"), "المركزية"),
-    (re.compile(r"(?<!\w)الإنجليز\s+ية(?!\w)"), "الإنجليزية"),
-    (re.compile(r"(?<!\w)التذكار\s+ية(?!\w)"), "التذكارية"),
-    (re.compile(r"(?<!\w)المر\s+يضات(?!\w)"), "المريضات"),
-    (re.compile(r"(?<!\w)مر\s+يضات(?!\w)"), "مريضات"),
-    (re.compile(r"(?<!\w)نم\s+اذج(?!\w)"), "نماذج"),
-    (re.compile(r"(?<!\w)فر\s+ق(?!\w)"), "فرق"),
-    (re.compile(r"(?<!\w)ب\s+فاعلية(?!\w)"), "بفاعلية"),
+    # Do not require word boundaries here: Arabic clitics such as و/ل/ب are
+    # commonly attached to the broken token (e.g. "وتوز يع", "لتعز يز").
+    # Each pattern still contains an impossible internal whitespace sequence,
+    # so the repair is presentation-only and does not invent content.
+    (re.compile(r"توز\s+يع"), "توزيع"),
+    (re.compile(r"ز\s+يارة"), "زيارة"),
+    (re.compile(r"تعز\s+يز"), "تعزيز"),
+    (re.compile(r"تدر\s+يب"), "تدريب"),
+    (re.compile(r"المعتمر\s+ين"), "المعتمرين"),
+    (re.compile(r"الخار\s+ج"), "الخارج"),
+    (re.compile(r"المركز\s+ية"), "المركزية"),
+    (re.compile(r"الإنجليز\s+ية"), "الإنجليزية"),
+    (re.compile(r"التذكار\s+ية"), "التذكارية"),
+    (re.compile(r"الكر\s+يم"), "الكريم"),
+    (re.compile(r"المر\s+يضات"), "المريضات"),
+    (re.compile(r"مر\s+يضات"), "مريضات"),
+    (re.compile(r"نم\s+اذج"), "نماذج"),
+    (re.compile(r"فر\s+ق"), "فرق"),
+    (re.compile(r"ب\s+فاعلية"), "بفاعلية"),
 )
 
 
@@ -797,6 +802,12 @@ def _clean_display_text(value):
     s = re.sub(r"\s+([؛;:.!?؟])", r"\1", s)
     s = re.sub(r"([\(\[«])\s+", r"\1", s)
     s = re.sub(r"\s+([\)\]»])", r"\1", s)
+    # Common OCR punctuation inversions around parenthesized lists.
+    s = re.sub(r"\b(تتضمن|شملت)\s*\(\s*:\s*", r"\1: (", s)
+    # Missing space after sentence punctuation can join two valid words.
+    s = re.sub(r"([.!؟])(?=[\u0600-\u06FF])", r"\1 ", s)
+    # Two high-confidence OCR diacritic-order errors present in Arabic reports.
+    s = s.replace("أرًزا", "أرزًا").replace("دعًما", "دعمًا")
     s = " ".join(s.split()).strip()
     return s or None
 
@@ -944,7 +955,7 @@ def ground_programs(programs, document: str):
 
         grounded.append(item)
 
-    log.info("grounding v8.2: structured=%s kept=%d dropped=%d nulled_fields=%d",
+    log.info("grounding v8.3: structured=%s kept=%d dropped=%d nulled_fields=%d",
              structured, len(grounded), dropped, nulled)
     return grounded, {
         "grounded_kept": len(grounded),

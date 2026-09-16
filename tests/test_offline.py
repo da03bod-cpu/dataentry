@@ -351,3 +351,57 @@ if __name__ == "__main__":
                 failures += 1
                 print(f"FAIL {name}: {type(exc).__name__}: {exc}")
     sys.exit(1 if failures else 0)
+
+
+def test_grounding_prefers_detail_occurrence_over_toc_and_keeps_context_fields():
+    from pipeline.grounding import ground_programs
+    doc = """16 1.مبادرة إفطار الصائمين
+17 2.مبادرة سقيا الحاج والمعتمر
+التقرير نصف السنوي لعام 2026
+مبادرة إفطار الصائمين
+تقديم وجبات جافة للصائمين خلال شهر رمضان المبارك
+عدد المستفيدين
+415900
+الفئة المستهدفة
+ضيوف الرحمن من الرجال والنساء
+مكان التنفيذ
+مصليات الحرم المكي الشريف
+مبادرة سقيا الحاج والمعتمر
+توزيع عبوات الماء البارد
+عدد المستفيدين
+534640
+"""
+    candidate = [{
+        "type": "project", "name": "مبادرة إفطار الصائمين", "year": 2026,
+        "description": "تقديم وجبات جافة للصائمين خلال شهر رمضان المبارك",
+        "beneficiaries_count": 415900, "budget": None,
+        "beneficiary_value": None,
+        "target_audience": "ضيوف الرحمن من الرجال والنساء",
+        "delivery_method": "مصليات الحرم المكي الشريف", "notes": None,
+    }]
+    out, _ = ground_programs(pl.clean_programs(candidate), doc)
+    assert len(out) == 1
+    assert out[0]["beneficiaries_count"] == 415900
+    assert out[0]["description"] == "تقديم وجبات جافة للصائمين خلال شهر رمضان المبارك"
+    assert out[0]["target_audience"] == "ضيوف الرحمن من الرجال والنساء"
+    assert out[0]["delivery_method"] == "مصليات الحرم المكي الشريف"
+    assert out[0]["year"] == 2026
+
+
+def test_grounding_does_not_accept_toc_sequence_as_beneficiary_count():
+    from pipeline.grounding import ground_programs
+    doc = """36 3.الدليل الإرشادي للجان الثقافية
+الدليل الإرشادي للجان الثقافية
+دليل إرشادي شامل يضم توجيهات تنظيمية
+عدد المستفيدين
+34 حملة مستفيدة
+مكان التنفيذ
+عن بعد
+"""
+    candidate = [{
+        "type": "project", "name": "الدليل الإرشادي للجان الثقافية",
+        "beneficiaries_count": 3,
+    }]
+    out, _ = ground_programs(pl.clean_programs(candidate), doc)
+    assert len(out) == 1
+    assert out[0]["beneficiaries_count"] == 34

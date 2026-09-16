@@ -631,3 +631,26 @@ def test_v82_supervisor_wrap_goes_to_target_not_delivery_or_notes():
     assert out[0]["target_audience"] == "مشرفات اللجان الثقافية في حملات الحج"
     assert out[0]["delivery_method"] == "عن بعد"
     assert out[0]["notes"] is None
+
+
+def test_v83_cleans_ocr_splits_even_with_attached_arabic_clitics():
+    from pipeline.grounding import _clean_display_text
+    samples = {
+        "تأهيل وتدر يب فرق تطوعية": "تأهيل وتدريب فرق تطوعية",
+        "لتعز يز أثر التجربة": "لتعزيز أثر التجربة",
+        "الحجاج والمعتمر ين والزوار": "الحجاج والمعتمرين والزوار",
+        "باللغتين العربية والإنجليز ية": "باللغتين العربية والإنجليزية",
+        "القرآن الكر يم": "القرآن الكريم",
+        "حجاج الداخل والخار ج من العرب": "حجاج الداخل والخارج من العرب",
+        "وتوز يع حلوى العيد": "وتوزيع حلوى العيد",
+    }
+    for raw, expected in samples.items():
+        assert _clean_display_text(raw) == expected
+
+
+def test_v83_cleans_common_parenthesis_and_sentence_spacing_ocr():
+    from pipeline.grounding import _clean_display_text
+    assert _clean_display_text("تتضمن(:أرًزا مع الدجاج)") == "تتضمن: (أرزًا مع الدجاج)"
+    assert _clean_display_text("شملت(:سجادة صلاة)") == "شملت: (سجادة صلاة)"
+    assert _clean_display_text("لخدمة الحجاج والمعتمر ين.رّكّز البرنامج") == "لخدمة الحجاج والمعتمرين. رّكّز البرنامج"
+    assert _clean_display_text("تقديم الهدايا لهن؛ دعًما نفسيًا") == "تقديم الهدايا لهن؛ دعمًا نفسيًا"

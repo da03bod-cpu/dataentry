@@ -44,7 +44,7 @@ _FIELD_HINTS = (
     "عدد المستفيدين", "عدد المستفيدات", "المستفيدين", "المستفيدات",
     "الفئة المستهدفة", "مكان التنفيذ", "آلية التنفيذ", "طريقة التنفيذ",
     "الميزانية", "الموازنة", "التكلفة", "عدد المتطوعين", "ساعات التطوع",
-    "عدد الهدايا", "عدد الوجبات", "عدد الحملات",
+    "عدد الهدايا", "عدد الوجبات", "عدد الحملات", "ملاحظات", "ملاحظة",
 )
 _BENEFICIARY_LABELS = (
     "عدد المستفيدين", "عدد المستفيدات", "إجمالي المستفيدين", "اجمالي المستفيدين",
@@ -56,6 +56,7 @@ _BUDGET_LABELS = (
 )
 _TARGET_LABELS = ("الفئة المستهدفة", "الفئات المستهدفة", "الفئة المستفيدة")
 _DELIVERY_LABELS = ("مكان التنفيذ", "موقع التنفيذ", "آلية التنفيذ", "طريقة التنفيذ")
+_NOTES_LABELS = ("ملاحظات", "ملاحظة", "ملاحظات المشروع", "ملاحظات البرنامج", "notes")
 
 # Normalized Arabic ordinals commonly used as report section headings.
 _ORDINALS = {
@@ -646,6 +647,10 @@ def _dynamic_audience_index(words, current_target: str | None):
         for token in (_norm("الخارج"), _norm("الخار"), _norm("العرب")):
             if token in nw:
                 candidates.append(nw.index(token))
+    # In RTL tables the target can wrap from "مشرفات اللجان الثقافية" to
+    # "في حملات الحج" while delivery is simply "عن بعد".
+    if _norm("مشرفات") in t and _norm("حملات") in nw and _norm("الحج") in nw:
+        candidates.append(nw.index(_norm("حملات")))
     return min(candidates) if candidates else None
 
 
@@ -748,12 +753,71 @@ def _infer_multicolumn_target_delivery(context: str):
         current_delivery = _join_parts(delivery_parts) or ""
         if (_norm("الرحمن") in n and any(x in _norm(current_target) for x in (_norm("ضيوف"), _norm("ضيفات")))) \
                 or (_norm("الحرام") in n and _norm("البيت") in _norm(current_target)) \
-                or (_norm("القطاع") in n and any(x in _norm(current_target) for x in (_norm("العاملون"), _norm("المهتمون")))):
+                or (_norm("القطاع") in n and any(x in _norm(current_target) for x in (_norm("العاملون"), _norm("المهتمون")))) \
+                or (_norm("مشرفات") in _norm(current_target) and _norm("حملات") in n and _norm("الحج") in n):
             _append_part(target_parts, raw)
         elif any(x in _norm(current_delivery) for x in (_norm("فندق"), _norm("مسجد"), _norm("مستشفى"), _norm("غرفة"), _norm("عن بعد"))):
             _append_part(delivery_parts, raw)
 
     return _join_parts(target_parts), _join_parts(delivery_parts)
+
+
+# Conservative display-only OCR repairs. These are common Arabic OCR token
+# splits, not semantic rewrites. Grounding still happens against the raw source
+# before this cleanup is applied.
+_OCR_DISPLAY_FIXES = (
+    (re.compile(r"(?<!\w)توز\s+يع(?!\w)"), "توزيع"),
+    (re.compile(r"(?<!\w)ز\s+يارة(?!\w)"), "زيارة"),
+    (re.compile(r"(?<!\w)تعز\s+يز(?!\w)"), "تعزيز"),
+    (re.compile(r"(?<!\w)تدر\s+يب(?!\w)"), "تدريب"),
+    (re.compile(r"(?<!\w)المعتمر\s+ين(?!\w)"), "المعتمرين"),
+    (re.compile(r"(?<!\w)الخار\s+ج(?!\w)"), "الخارج"),
+    (re.compile(r"(?<!\w)المركز\s+ية(?!\w)"), "المركزية"),
+    (re.compile(r"(?<!\w)الإنجليز\s+ية(?!\w)"), "الإنجليزية"),
+    (re.compile(r"(?<!\w)التذكار\s+ية(?!\w)"), "التذكارية"),
+    (re.compile(r"(?<!\w)المر\s+يضات(?!\w)"), "المريضات"),
+    (re.compile(r"(?<!\w)مر\s+يضات(?!\w)"), "مريضات"),
+    (re.compile(r"(?<!\w)نم\s+اذج(?!\w)"), "نماذج"),
+    (re.compile(r"(?<!\w)فر\s+ق(?!\w)"), "فرق"),
+    (re.compile(r"(?<!\w)ب\s+فاعلية(?!\w)"), "بفاعلية"),
+)
+
+
+def _clean_display_text(value):
+    """Clean only obvious OCR/spacing artefacts after grounding."""
+    if value is None:
+        return None
+    s = unicodedata.normalize("NFKC", str(value))
+    # Remove a stray Arabic combining mark that OCR leaves after whitespace,
+    # e.g. "مبادرة ُسلوان". Do not strip valid marks inside words.
+    s = re.sub(r"(^|\s)[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]+", r"\1", s)
+    for pattern, repl in _OCR_DISPLAY_FIXES:
+        s = pattern.sub(repl, s)
+    s = re.sub(r"\s*[،,]\s*", "، ", s)
+    s = re.sub(r"\s+([؛;:.!?؟])", r"\1", s)
+    s = re.sub(r"([\(\[«])\s+", r"\1", s)
+    s = re.sub(r"\s+([\)\]»])", r"\1", s)
+    s = " ".join(s.split()).strip()
+    return s or None
+
+
+def _clean_delivery_display(value):
+    s = _clean_display_text(value)
+    if not s:
+        return s
+    # Re-introduce obvious separators lost by multi-column OCR. This is only
+    # formatting; it does not add a new place that was not already present.
+    s = re.sub(r"^(مقر الجمعية)\s+(?=(?:الفنادق|الحملات|حملات|مسجد|مصلى|مصليات|مستشفى|غرفة|ساحات|المنطقة))", r"\1، ", s)
+    s = re.sub(r"\s+،\s*", "، ", s)
+    return s
+
+
+def _explicit_notes(context: str):
+    """Return source notes only when a notes label is actually present."""
+    context_n = _norm(context)
+    if not any(_norm(lbl) in context_n for lbl in _NOTES_LABELS):
+        return None
+    return _infer_simple_label_text(context, _NOTES_LABELS)
 
 
 def _beneficiary_value_is_audience(value, target_audience) -> bool:
@@ -839,10 +903,19 @@ def ground_programs(programs, document: str):
             nulled += 1
 
         # Keep model text fields only when they occur in this exact item section.
-        for key in ("beneficiary_value", "target_audience", "delivery_method", "notes"):
+        # Notes are stricter: arbitrary nearby text is not a note unless the
+        # source itself has an explicit notes label.
+        for key in ("beneficiary_value", "target_audience", "delivery_method"):
             if item.get(key) is not None and not _text_is_grounded(item[key], context):
                 item[key] = None
                 nulled += 1
+
+        source_notes = _explicit_notes(context)
+        if source_notes:
+            item["notes"] = source_notes
+        elif item.get("notes") is not None:
+            item["notes"] = None
+            nulled += 1
 
         # Deterministic fill for labelled layouts. First try the wrapped RTL
         # multi-column parser, then fall back to one-column label/value extraction.
@@ -864,9 +937,14 @@ def ground_programs(programs, document: str):
             item["beneficiary_value"] = None
             nulled += 1
 
+        # Final presentation cleanup happens only after strict grounding.
+        for key in ("name", "description", "beneficiary_value", "target_audience", "notes"):
+            item[key] = _clean_display_text(item.get(key))
+        item["delivery_method"] = _clean_delivery_display(item.get("delivery_method"))
+
         grounded.append(item)
 
-    log.info("grounding v7: structured=%s kept=%d dropped=%d nulled_fields=%d",
+    log.info("grounding v8.2: structured=%s kept=%d dropped=%d nulled_fields=%d",
              structured, len(grounded), dropped, nulled)
     return grounded, {
         "grounded_kept": len(grounded),

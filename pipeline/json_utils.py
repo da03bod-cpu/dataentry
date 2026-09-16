@@ -68,8 +68,20 @@ def parse_program_items(raw_text, truncated=False):
     m = re.search(r"[\{\[]", text)
     if m:
         try:
-            data, _ = _decoder.raw_decode(text, m.start())
-            return _items_of(data)
+            data, pos = _decoder.raw_decode(text, m.start())
+            items = _items_of(data)
+            # The model sometimes emits several top-level objects instead of one
+            # array: {...}\n{...}\n{...}. Keep reading until the text runs out.
+            while True:
+                nxt = re.match(r"[\s,]*(?=[\{\[])", text[pos:])
+                if not nxt:
+                    break
+                try:
+                    more, pos = _decoder.raw_decode(text, pos + nxt.end())
+                except json.JSONDecodeError:
+                    break
+                items.extend(_items_of(more))
+            return items
         except json.JSONDecodeError:
             pass
 

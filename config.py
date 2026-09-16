@@ -23,20 +23,59 @@ def _float(name, default):
 
 
 # ---------------------------------------------------------------- caches
-# Only use the network volume when it is actually mounted; otherwise caches
-# stay inside the container instead of pointing at a missing path.
 _VOLUME = "/runpod-volume"
-if os.path.isdir(_VOLUME):
+
+
+def _writable(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".write_test")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+# A real network volume is used for caches only if it is writable. RunPod's
+# "Cached model" feature also mounts under /runpod-volume, but read-only.
+if os.path.isdir(_VOLUME) and _writable(f"{_VOLUME}/huggingface"):
     os.environ.setdefault("HF_HOME", f"{_VOLUME}/huggingface")
     os.environ.setdefault("PADDLE_PDX_CACHE_HOME", f"{_VOLUME}/paddlex")
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 os.environ.pop("TRANSFORMERS_CACHE", None)  # deprecated; HF_HOME is enough
 
+
 # ---------------------------------------------------------------- models
-_BAKED_QWEN = "/models/Qwen3-8B"  # filled when the image is built with BAKE_QWEN=1
-QWEN_MODEL_NAME = os.getenv("QWEN_MODEL_NAME") or (
-    _BAKED_QWEN if os.path.isfile(os.path.join(_BAKED_QWEN, "config.json")) else "Qwen/Qwen3-8B"
-)
+def _runpod_cached_snapshot(repo_id):
+    """Local snapshot dir of a model added in the endpoint's "Cached model" field."""
+    base = os.path.join(_VOLUME, "huggingface-cache", "hub", "models--" + repo_id.replace("/", "--"))
+    ref = os.path.join(base, "refs", "main")
+    candidates = []
+    if os.path.isfile(ref):
+        with open(ref) as f:
+            candidates.append(os.path.join(base, "snapshots", f.read().strip()))
+    snapshots = os.path.join(base, "snapshots")
+    if os.path.isdir(snapshots):
+        candidates += sorted(
+            (os.path.join(snapshots, d) for d in os.listdir(snapshots)),
+            key=os.path.getmtime, reverse=True,
+        )
+    return next((c for c in candidates if os.path.isfile(os.path.join(c, "config.json"))), None)
+
+
+def _resolve_model(repo_id):
+    if os.path.isdir(repo_id):
+        return repo_id
+    baked = "/models/" + repo_id.split("/")[-1]  # filled when built with BAKE_QWEN=1
+    if os.path.isfile(os.path.join(baked, "config.json")):
+        return baked
+    return _runpod_cached_snapshot(repo_id) or repo_id
+
+
+QWEN_REPO_ID = os.getenv("QWEN_MODEL_NAME", "Qwen/Qwen3-8B")
+QWEN_MODEL_NAME = _resolve_model(QWEN_REPO_ID)
 LORA_PATH = os.getenv("LORA_PATH", "/app/lora-release")
 LOAD_IN_4BIT = _bool("LOAD_IN_4BIT", True)
 PRELOAD_MODELS = _bool("PRELOAD_MODELS", True)

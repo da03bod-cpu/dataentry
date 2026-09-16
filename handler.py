@@ -32,3 +32,4 @@ if __name__ == "__main__":
             # Keep the worker alive so each job reports the real error to n8n.
             log.exception("Model preload failed")
     runpod.serverless.start({"handler": handler})
+    

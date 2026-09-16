@@ -343,7 +343,7 @@ def _extract_pdf(path):
                         continue
                     if _letters(ocr_text) >= _letters(page_texts[i]) or _arabic_looks_reversed(page_texts[i]):
                         page_texts[i] = ocr_text
-            method = "paddleocr-vl" if len(ocr_pages) == len(page_texts) else "pdf-text-layer+paddleocr-vl"
+            method = "tesseract-ocr" if len(ocr_pages) == len(page_texts) else "pdf-text-layer+tesseract-ocr"
         elif ocr_pages:
             warnings.append(f"{len(ocr_pages)} page(s) look scanned but OCR is disabled.")
 

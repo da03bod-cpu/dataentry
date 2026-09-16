@@ -405,3 +405,48 @@ def test_grounding_does_not_accept_toc_sequence_as_beneficiary_count():
     out, _ = ground_programs(pl.clean_programs(candidate), doc)
     assert len(out) == 1
     assert out[0]["beneficiaries_count"] == 34
+
+
+def test_v6_structural_recovery_builds_programs_and_projects_from_document():
+    from pipeline.grounding import ground_programs
+    doc = """14 البرامج والمبادرات
+15 أولا: برامج الإطعام
+16 1.مبادرة إفطار الصائمين
+17 2.مبادرة سقيا الماء
+18 3.دورة تدريب المتطوعات
+
+أولًا: برامج الإطعام
+وصف برنامج الإطعام من المصدر.
+مبادرة إفطار الصائمين
+تقديم وجبات جافة للصائمين
+عدد المستفيدين
+415900
+التقرير
+ف 16
+مبادرة سقيا الماء
+توزيع عبوات الماء
+عدد المستفيدين
+534640
+التقرير
+ف 17
+ثانيًا: برامج التدريب
+تأهيل المتطوعات لخدمة المستفيدين.
+دورة تدريب المتطوعات
+دورة تدريبية عملية
+عدد المستفيدين
+67
+التقرير
+ف 18
+تكريم المتطوعات
+فعالية جانبية ليست ضمن قائمة البرامج والمشاريع.
+"""
+    out, meta = ground_programs([], doc)
+    assert meta["structured_recovery"] is True
+    assert [x["name"] for x in out if x["type"] == "program"] == ["برامج الإطعام", "برامج التدريب"]
+    projects = [x for x in out if x["type"] == "project"]
+    assert [x["name"] for x in projects] == [
+        "مبادرة إفطار الصائمين", "مبادرة سقيا الماء", "دورة تدريب المتطوعات"
+    ]
+    assert [x["beneficiaries_count"] for x in projects] == [415900, 534640, 67]
+    assert projects[0]["description"] == "تقديم وجبات جافة للصائمين"
+    assert all("تكريم المتطوعات" != x["name"] for x in out)

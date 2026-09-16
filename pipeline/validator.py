@@ -16,9 +16,9 @@ TEXT_FIELDS = ("description", "beneficiary_value", "target_audience", "delivery_
 _DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
 _NULL_WORDS = {"", "null", "none", "n/a", "na", "-", "—", "غير متوفر", "غير محدد", "لا يوجد", "لا توجد"}
 _MULTIPLIERS = (
-    (re.compile(r"مليار|billion|\bbn\b", re.I), 1e9),
-    (re.compile(r"مليون|million|\bmn\b|\bm\b", re.I), 1e6),
-    (re.compile(r"ألف|الف|آلاف|الاف|thousand|\bk\b", re.I), 1e3),
+    (re.compile(r"(?<!\w)(?:مليار|billion|bn)(?!\w)", re.I), 1e9),
+    (re.compile(r"(?<!\w)(?:مليون|million|mn|m)(?!\w)", re.I), 1e6),
+    (re.compile(r"(?<!\w)(?:ألف|الف|آلاف|الاف|thousand|k)(?!\w)", re.I), 1e3),
 )
 
 

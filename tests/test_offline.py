@@ -1,4 +1,4 @@
-"""Offline tests: no GPU, no Qwen, no PaddleOCR.
+"""Offline tests: no GPU, no Qwen, no live OCR engine required.
 
 Run:  python -m pytest -q tests        (or)   python tests/test_offline.py
 """
@@ -270,7 +270,7 @@ def test_scanned_pdf_goes_to_ocr():
     finally:
         ex.ENABLE_OCR = False
         del sys.modules["pipeline.ocr"]
-    assert calls == [True] and r.method == "paddleocr-vl" and "برنامج من OCR" in r.text
+    assert calls == [True] and r.method == "tesseract-ocr" and "برنامج من OCR" in r.text
 
 
 def test_equal_adjacent_cells_do_not_shift_columns():

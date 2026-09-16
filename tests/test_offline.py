@@ -450,3 +450,116 @@ def test_v6_structural_recovery_builds_programs_and_projects_from_document():
     assert [x["beneficiaries_count"] for x in projects] == [415900, 534640, 67]
     assert projects[0]["description"] == "تقديم وجبات جافة للصائمين"
     assert all("تكريم المتطوعات" != x["name"] for x in out)
+
+
+def test_v7_multicolumn_rtl_reconstructs_target_and_delivery():
+    from pipeline.grounding import _infer_multicolumn_target_delivery
+
+    cases = [
+        (
+            """عدد المتطوعين ساعات التطوع مكان التنفيذ الفئة المستهدفة
+مقر الجمعية ، ضيوف الرحمن من
+12 116 الفنادق الرجال والنساء.
+""",
+            "ضيوف الرحمن من الرجال والنساء.",
+            "مقر الجمعية الفنادق",
+        ),
+        (
+            """عدد المتطوعين ساعات التطوع مكان التنفيذ الفئة المستهدفة
+مقر الجمعية ، ضيوف الرحمن من
+44 206 الفنادق ،الحملات النساء
+""",
+            "ضيوف الرحمن من النساء",
+            "مقر الجمعية الفنادق ،الحملات",
+        ),
+        (
+            """عدد المتطوعين ساعات التطوع مكان التنفيذ الفئة المستهدفة
+مستشفى النور المر يضات من ضيفات
+3 6 التخصصي بمكة الرحمن
+المكرمة
+""",
+            "المر يضات من ضيفات الرحمن",
+            "مستشفى النور التخصصي بمكة المكرمة",
+        ),
+        (
+            """عدد المتطوعين ساعات التطوع مكان التنفيذ الفئة المستهدفة
+مقر الجمعية ، أطفال زائرات البيت
+9 58 الفنادق الحرام
+""",
+            "أطفال زائرات البيت الحرام",
+            "مقر الجمعية الفنادق",
+        ),
+        (
+            """عدد المتطوعين ساعات التطوع مكان التنفيذ الفئة المستهدفة
+العاملون والمهتمون
+2 12 غرفة مكة المكرمة
+بالقطاع غير الربحي
+""",
+            "العاملون والمهتمون بالقطاع غير الربحي",
+            "غرفة مكة المكرمة",
+        ),
+        (
+            """الفئة المستهدفة مكان التنفيذ
+ضيوف الرحمن من الرجال والنساء مصليات الحرم المكي الشريف
+""",
+            "ضيوف الرحمن من الرجال والنساء",
+            "مصليات الحرم المكي الشريف",
+        ),
+        (
+            """عدد المتطوعين ساعات التطوع مكان التنفيذ الفئة المستهدفة
+مقر الجمعية ، الحاجات والمعتمرات
+90 598 الفنادق ،الحملات والزائرات
+""",
+            "الحاجات والمعتمرات والزائرات",
+            "مقر الجمعية الفنادق ،الحملات",
+        ),
+        (
+            """عدد المتطوعين ساعات التطوع مكان التنفيذ الفئة المستهدفة
+مقر الجمعية ،حملات حملات حجاج الداخل
+5 100 الحج والخار ج من العرب
+""",
+            "حملات حجاج الداخل والخار ج من العرب",
+            "مقر الجمعية ،حملات الحج",
+        ),
+    ]
+    for context, target, delivery in cases:
+        got_target, got_delivery = _infer_multicolumn_target_delivery(context)
+        assert got_target == target, (got_target, target, context)
+        assert got_delivery == delivery, (got_delivery, delivery, context)
+
+
+def test_v7_beneficiary_value_never_duplicates_target_audience():
+    from pipeline.grounding import ground_programs
+    doc = """مبادرة إفطار الصائمين
+تقديم وجبات جافة للصائمين
+عدد المستفيدين
+415900
+الفئة المستهدفة مكان التنفيذ
+ضيوف الرحمن من الرجال والنساء مصليات الحرم المكي الشريف
+"""
+    candidate = [{
+        "type": "project", "name": "مبادرة إفطار الصائمين", "year": 2026,
+        "beneficiary_value": "ضيوف الرحمن من الرجال والنساء",
+        "target_audience": "ضيوف الرحمن من الرجال والنساء",
+    }]
+    out, _ = ground_programs(pl.clean_programs(candidate), doc)
+    assert len(out) == 1
+    assert out[0]["beneficiary_value"] is None
+
+
+def test_v7_keeps_real_beneficiary_value_when_grounded_and_not_audience():
+    from pipeline.grounding import ground_programs
+    doc = """مبادرة إفطار الصائمين
+تقديم وجبات جافة للصائمين
+عدد المستفيدين
+415900
+الفئة المستهدفة
+ضيوف الرحمن
+"""
+    candidate = [{
+        "type": "project", "name": "مبادرة إفطار الصائمين",
+        "beneficiary_value": "وجبات جافة", "target_audience": "ضيوف الرحمن",
+    }]
+    out, _ = ground_programs(pl.clean_programs(candidate), doc)
+    assert len(out) == 1
+    assert out[0]["beneficiary_value"] == "وجبات جافة"

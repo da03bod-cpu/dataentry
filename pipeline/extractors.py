@@ -79,9 +79,9 @@ def _row_line(values):
     cells = [_cell(v) for v in values]
     while cells and not cells[-1]:
         cells.pop()
-    # merged cells repeat the same text across columns
-    deduped = [c for i, c in enumerate(cells) if i == 0 or c != cells[i - 1] or not c]
-    return " | ".join(deduped) if any(deduped) else ""
+    # Never drop cells by text: two columns can legitimately hold the same value
+    # (e.g. 3000 | 3000) and dropping one shifts the row under the wrong headers.
+    return " | ".join(cells) if any(cells) else ""
 
 
 def decode_bytes(raw: bytes) -> str:
@@ -200,7 +200,13 @@ def _extract_docx(path):
         elif child.tag == qn("w:tbl"):
             rows = []
             for row in Table(child, doc).rows:
-                line = _row_line(clean_text(cell.text).replace("\n", " ") for cell in row.cells)
+                cells, seen_tc = [], set()
+                for cell in row.cells:  # a horizontally merged cell is the SAME <w:tc> repeated
+                    if id(cell._tc) in seen_tc:
+                        continue
+                    seen_tc.add(id(cell._tc))
+                    cells.append(clean_text(cell.text).replace("\n", " "))
+                line = _row_line(cells)
                 if line:
                     rows.append(line)
             if rows:

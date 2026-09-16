@@ -272,6 +272,29 @@ def test_scanned_pdf_goes_to_ocr():
     assert calls == [True] and r.method == "paddleocr-vl" and "برنامج من OCR" in r.text
 
 
+def test_equal_adjacent_cells_do_not_shift_columns():
+    from pipeline.extractors import _row_line
+    assert _row_line(["كفالة الأيتام", "3000", "3000", "29991"]) == "كفالة الأيتام | 3000 | 3000 | 29991"
+
+
+def test_docx_merged_cells_not_repeated_but_equal_values_kept():
+    from docx import Document
+    doc = Document()
+    t = doc.add_table(rows=2, cols=4)
+    a = t.rows[0].cells[0].merge(t.rows[0].cells[1]); a.text = "عنوان مدمج"
+    for i, v in enumerate(["إفطار صائم", "3000", "3000", "29991"]):
+        t.rows[1].cells[i].text = v
+    path = TMP / "merged.docx"; doc.save(path)
+    text = extract_file(path, "merged.docx").text
+    assert "عنوان مدمج\n" in text and "عنوان مدمج | عنوان مدمج" not in text, text
+    assert "إفطار صائم | 3000 | 3000 | 29991" in text
+
+
+def test_multiple_top_level_objects():
+    out = '{"name":"أ"}\n{"name":"ب"},\n{"programs":[{"name":"ج"}]}'
+    assert [i["name"] for i in parse_program_items(out)] == ["أ", "ب", "ج"]
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):

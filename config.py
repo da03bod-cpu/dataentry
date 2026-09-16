@@ -79,7 +79,7 @@ QWEN_MODEL_NAME = _resolve_model(QWEN_REPO_ID)
 LOAD_IN_4BIT = _bool("LOAD_IN_4BIT", True)
 PRELOAD_MODELS = _bool("PRELOAD_MODELS", True)
 STRICT_GROUNDING = _bool("STRICT_GROUNDING", True)
-APP_VERSION = os.getenv("APP_VERSION", "strict-grounded-v5")
+APP_VERSION = os.getenv("APP_VERSION", "strict-grounded-v6")
 
 # ---------------------------------------------------------------- generation
 MAX_INPUT_CHARS = _int("MAX_INPUT_CHARS", 0)  # 0 = do not truncate program_extract

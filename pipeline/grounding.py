@@ -104,6 +104,16 @@ _DESCRIPTION_STARTS = (
 )
 
 
+# Prose/connectors that must never become an entity name merely because they
+# occur inside a programs/projects section or around a colon.
+_NON_ENTITY_STARTS = (
+    "ومنها", "ومن ذلك", "وذلك", "حيث", "كما", "قال", "قال رسول", "رواه", "أخرجه",
+    "نسعى", "تسعى", "يهدف", "تهدف", "تقديم", "توزيع", "زيارة", "استقبال",
+    "توجيه وإرشاد", "تأهيل وتدريب", "في إطار", "ضمن إطار", "انطلاقا",
+    "therefore", "where", "aims to", "the program aims",
+)
+
+
 def _norm(value) -> str:
     if value is None:
         return ""
@@ -434,6 +444,83 @@ def _description_like(text: str) -> bool:
     return False
 
 
+def _starts_non_entity_prose(text: str) -> bool:
+    n = _norm(text)
+    return any(n == _norm(x) or n.startswith(_norm(x) + " ") for x in _NON_ENTITY_STARTS)
+
+
+def _has_strong_entity_prefix(text: str) -> bool:
+    n = _norm(text)
+    prefixes = _PROGRAM_PREFIXES + _PROJECT_STRONG_PREFIXES + _FLEX_ENTITY_PREFIXES
+    return any(n == _norm(x) or n.startswith(_norm(x) + " ") for x in prefixes)
+
+
+def _plausible_model_entity_name(text: str) -> bool:
+    """Conservative name gate for model-only candidates.
+
+    A candidate may be unusual, but ordinary prose/attributions/connectors inside a
+    list must not be promoted just because the list context says "program".
+    """
+    t = " ".join(str(text or "").strip().split())
+    n = _norm(t)
+    if not t or not n or _is_page_artifact(t):
+        return False
+    if _starts_non_entity_prose(t):
+        return False
+    if any(q in t for q in ('"', '“', '”', '«', '»')) and not _has_strong_entity_prefix(t):
+        return False
+    if _description_like(t) and not _has_strong_entity_prefix(t):
+        return False
+    # Long prefixless prose is much more likely a description than a title.
+    if len(n.split()) > 10 and not _has_strong_entity_prefix(t):
+        return False
+    return True
+
+
+def _parallel_title_cells(raw: str, forced_type: str | None):
+    """Recover multiple visually parallel headings preserved as `A | B | C`."""
+    if not forced_type or "|" not in str(raw or ""):
+        return []
+    cells = [c.strip() for c in str(raw).split("|") if c.strip()]
+    if not (2 <= len(cells) <= 8):
+        return []
+    out = []
+    for cell in cells:
+        ent = _standalone_entity(cell, forced_type=forced_type)
+        if not ent or not _plausible_model_entity_name(ent[0]):
+            return []
+        out.append(ent)
+    return out
+
+
+def _arabic_lexemes(text: str):
+    """Loose Arabic/Latin lexemes for semantic title-to-description anchoring."""
+    n = _norm(text)
+    stop = {_norm(x) for x in (
+        "برنامج", "البرنامج", "مشروع", "المشروع", "مبادرة", "المبادرة",
+        "برامج", "مشاريع", "مبادرات", "من", "في", "على", "الى", "إلى", "عن",
+    )}
+    out = []
+    for tok in n.split():
+        if tok in stop or len(tok) <= 2:
+            continue
+        base = tok
+        # Strip common Arabic clitics conservatively for matching only.
+        if len(base) > 4 and base[0] in "وفبكل":
+            base = base[1:]
+        if base.startswith("ال") and len(base) > 4:
+            base = base[2:]
+        if len(base) > 2:
+            out.append(base)
+    return list(dict.fromkeys(out))
+
+
+def _lexeme_overlap(title: str, text: str) -> int:
+    wanted = set(_arabic_lexemes(title))
+    got = set(_arabic_lexemes(text))
+    return len(wanted & got)
+
+
 def _title_score(text: str) -> int:
     """Heuristic score for a short entity title fragment around a colon."""
     t = " ".join(str(text or "").strip().lstrip("*•-–— ").split())
@@ -475,8 +562,19 @@ def _inline_title_description(raw: str, forced_type=None):
         for title, desc in ((left, right), (right, left)):
             if not title:
                 continue
+            if _starts_non_entity_prose(title):
+                continue
+            # If the left side is clearly prose, do not reinterpret the short
+            # right-side tail as a title merely because RTL extraction inverted
+            # the visual order. A strong lexical entity prefix can still override.
+            if title == right and _starts_non_entity_prose(left) and not _has_strong_entity_prefix(title):
+                continue
             score = _title_score(title)
             if forced_type and score >= 0:
+                # Inside a declared list, a prefixless inline title must still be
+                # compact. Long prose before/after a colon is not an entity name.
+                if not _has_strong_entity_prefix(title) and len(_norm(title).split()) > 5:
+                    score -= 8
                 score += 3
             # Prefer an opposite side that actually looks descriptive, while still
             # allowing a bare `name:` heading with no same-line description.
@@ -498,7 +596,7 @@ def _standalone_entity(raw: str, forced_type=None):
     if not _is_short_heading(text):
         return None
     n = _norm(text)
-    if not n or _description_like(text) or re.fullmatch(r"\d+(?:[.,]\d+)?", n):
+    if not n or _description_like(text) or _starts_non_entity_prose(text) or re.fullmatch(r"\d+(?:[.,]\d+)?", n):
         return None
     prefix_norms = {_norm(x) for x in _PROGRAM_PREFIXES + _PROJECT_STRONG_PREFIXES + _FLEX_ENTITY_PREFIXES}
     if sum(tok in prefix_norms for tok in n.split()) > 1:
@@ -599,6 +697,18 @@ def _generic_item_at_line(raw_lines, idx: int, list_type=None):
         # Prefixless names are common inside `أبرز البرامج`. Do not accept every
         # short continuation line: require evidence that the next meaningful line
         # behaves like a description, field, or inline next structure.
+        current_words = _norm(raw).split()
+        prev_raw = None
+        for j in range(idx - 1, max(-1, idx - 4), -1):
+            if raw_lines[j].strip() and not _is_page_artifact(raw_lines[j]):
+                prev_raw = " ".join(raw_lines[j].strip().split())
+                break
+        if prev_raw and len(current_words) <= 3:
+            prev_n = _norm(prev_raw)
+            # A tiny line after a long comma/semicolon sentence is usually a
+            # wrapped continuation (e.g. "على الوجه" / "الصحيح"), not a heading.
+            if len(prev_n.split()) >= 5 and any(c in prev_raw for c in ("،", ";", "؛")) and not prev_raw.endswith((".", "؟", "!")):
+                return None
         tentative = _standalone_entity(raw, forced_type=list_type)
         if not tentative or _description_like(raw):
             return None
@@ -703,6 +813,13 @@ def _discover_structure(document: str):
         # financial-note mentions such as "مشروع كفالة..." into execution records.
         if active_type is None:
             continue
+
+        parallel = _parallel_title_cells(raw, active_type)
+        if parallel:
+            for title, typ in parallel:
+                add(title, typ, i, 6)
+            continue
+
         ent = _generic_item_at_line(raw_lines, i, active_type)
         if not ent:
             continue
@@ -750,6 +867,7 @@ def _augment_from_structure(programs, document: str):
         base = dict(_best_candidate(programs or [], title) or _blank_record(title, typ))
         base["name"] = title
         base["type"] = typ
+        base["__structural"] = True
         out.append(base)
         seen.add(_name_key(title))
 
@@ -759,7 +877,9 @@ def _augment_from_structure(programs, document: str):
     for p in programs or []:
         key = _name_key(p.get("name"))
         if key and key not in seen:
-            out.append(dict(p))
+            extra = dict(p)
+            extra["__structural"] = False
+            out.append(extra)
             seen.add(key)
 
     log.info("structural recovery: discovered=%d (programs=%d projects=%d) model_candidates=%d union=%d",
@@ -880,8 +1000,29 @@ def _unique_document_year(document: str):
         if count >= 1:
             return year
 
+    # Covers/first-page headers frequently show only `1445 - 2023` or `2024`
+    # without the words "annual report". Prefer a unique Gregorian year in the
+    # first few meaningful lines before scanning the whole document, where IBANs
+    # and account numbers can accidentally contain year-looking 4-digit groups.
+    early_lines = [ln for ln in text.splitlines() if ln.strip()][:20]
+    early_years = []
+    for ln in early_lines:
+        nln = _norm(ln)
+        if nln.startswith(("sa", _norm("حساب"), _norm("مصرف"), _norm("بنك"))):
+            continue
+        early_years.extend(int(x) for x in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", ln))
+    if early_years:
+        uniq = list(dict.fromkeys(early_years))
+        if len(uniq) == 1:
+            return uniq[0]
+
     from collections import Counter
-    years = [int(n) for n in _numbers(text) if float(n).is_integer() and 1900 <= int(n) <= 2100]
+    years = []
+    for ln in text.splitlines():
+        nln = _norm(ln)
+        if nln.startswith(("sa", _norm("حساب"), _norm("مصرف"), _norm("بنك"))):
+            continue
+        years.extend(int(x) for x in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", ln))
     if not years:
         return None
     c = Counter(years)
@@ -906,6 +1047,12 @@ def _number_near_labels(value, evidence: str, labels, lookahead_lines: int = 5) 
 
 
 def _canonical_name_from_occurrence(raw_lines, idx: int, fallback: str):
+    # Preserve one title from a visually parallel `A | B` heading row.
+    if "|" in raw_lines[idx]:
+        list_type = _nearest_list_type(raw_lines, idx)
+        for cell, _typ in _parallel_title_cells(raw_lines[idx], list_type):
+            if _name_key(cell) == _name_key(fallback):
+                return cell
     # Prefer structural title parsers that can join wrapped parenthetical subtitles
     # before the generic short-title parser.
     proj = _canonical_project_title(raw_lines, idx)
@@ -1038,7 +1185,57 @@ def _looks_like_detail_list_start(raw: str) -> bool:
     return n.startswith(_norm("المركز الاول")) or n.startswith(_norm("المركز الثاني")) or n.startswith(_norm("المركز الثالث"))
 
 
-def _infer_description(raw_lines, start_idx: int, hi: int, canonical_name: str):
+def _infer_parallel_description(raw_lines, start_idx: int, canonical_name: str):
+    """Find the matching prose block for one title from a parallel heading row.
+
+    Multi-column DOCX/PDF extraction can emit `Title A | Title B` before emitting
+    each column's prose in a different linear order.  Match prose semantically to
+    the title instead of assuming that the next paragraph belongs to the first cell.
+    """
+    if "|" not in raw_lines[start_idx]:
+        return None
+    wanted = _arabic_lexemes(canonical_name)
+    needed = min(2, len(wanted))
+    if needed <= 0:
+        return None
+    list_type = _nearest_list_type(raw_lines, start_idx)
+    start = None
+    for k in range(start_idx + 1, min(len(raw_lines), start_idx + 80)):
+        raw = " ".join(raw_lines[k].strip().split())
+        if not raw or _is_page_artifact(raw) or re.fullmatch(r"\d{1,3}", _norm(raw)):
+            continue
+        if _looks_like_major_section_heading(raw) or _list_context_from_heading(raw):
+            break
+        if _lexeme_overlap(canonical_name, raw) >= needed and _plausible_model_entity_name(canonical_name):
+            # Do not pick a different entity heading that happens to share words.
+            ent = _generic_item_at_line(raw_lines, k, list_type)
+            if ent and _name_key(ent[0]) != _name_key(canonical_name):
+                continue
+            start = k
+            break
+    if start is None:
+        return None
+
+    out = []
+    for k in range(start, min(len(raw_lines), start + 12)):
+        raw = " ".join(raw_lines[k].strip().split())
+        if not raw or _is_page_artifact(raw) or re.fullmatch(r"\d{1,3}", _norm(raw)):
+            continue
+        if k > start:
+            if _looks_like_major_section_heading(raw) or _list_context_from_heading(raw):
+                break
+            ent = _generic_item_at_line(raw_lines, k, list_type)
+            if ent and _name_key(ent[0]) != _name_key(canonical_name):
+                break
+        out.append(raw)
+    text = " ".join(out).strip()
+    return text[:3000] if text else None
+
+
+def _infer_description(raw_lines, start_idx: int, hi: int, canonical_name: str, all_names=None):
+    parallel = _infer_parallel_description(raw_lines, start_idx, canonical_name)
+    if parallel:
+        return parallel
     out = []
     inline = _inline_description_for_name(raw_lines[start_idx], canonical_name)
     if inline:
@@ -1074,6 +1271,17 @@ def _infer_description(raw_lines, start_idx: int, hi: int, canonical_name: str):
         # description (common in annual reports).
         if out and _looks_like_detail_list_start(raw):
             break
+        # Multi-column extraction can emit another item's prose before its heading
+        # appears linearly. Stop when a new prose block is strongly anchored to a
+        # different known title and not to the current title.
+        if out and all_names:
+            current_overlap = _lexeme_overlap(canonical_name, raw)
+            for other in all_names:
+                if _name_key(other) == _name_key(canonical_name):
+                    continue
+                need = min(2, len(_arabic_lexemes(other)))
+                if need and _lexeme_overlap(other, raw) >= need and current_overlap < need:
+                    return " ".join(out).strip()[:3000] or None
         # If the current line itself is the title occurrence, do not echo it.
         if _line_matches_name(_norm(raw), canonical_name) and len(_norm(raw).split()) <= len(_norm(canonical_name).split()) + 1:
             continue
@@ -1356,6 +1564,9 @@ def _clean_display_text(value):
     s = re.sub(r"\b(تتضمن|شملت)\s*\(\s*:\s*", r"\1: (", s)
     # Missing space after sentence punctuation can join two valid words.
     s = re.sub(r"([.!؟])(?=[\u0600-\u06FF])", r"\1 ", s)
+    # Common Arabic OCR join: a word ending in taa marbuta followed by a
+    # prepositional definite phrase, e.g. "الحفاوةبالزائرات".
+    s = re.sub(r"ة(?=(?:بال|لل)[\u0600-\u06FF])", "ة ", s)
     # Two high-confidence OCR diacritic-order errors present in Arabic reports.
     s = s.replace("أرًزا", "أرزًا").replace("دعًما", "دعمًا")
     s = " ".join(s.split()).strip()
@@ -1381,6 +1592,22 @@ def _explicit_notes(context: str):
     return _infer_simple_label_text(context, _NOTES_LABELS)
 
 
+def _text_field_is_redundant_description(value, description) -> bool:
+    if not value or not description:
+        return False
+    v = _norm(value)
+    d = _norm(description)
+    if not v or not d:
+        return False
+    if v == d:
+        return True
+    # A long sentence copied almost verbatim from the description is not a
+    # beneficiary value, target audience, or delivery method.
+    if len(v.split()) >= 8 and (v in d or d in v):
+        return True
+    return False
+
+
 def _beneficiary_value_is_audience(value, target_audience) -> bool:
     """Reject audience text accidentally copied into beneficiary_value."""
     if not value:
@@ -1404,7 +1631,12 @@ def ground_programs(programs, document: str):
     grounded = []
     dropped = 0
     nulled = 0
-    names = [p.get("name") for p in candidates if p.get("name")]
+    # Only plausible names may act as context boundaries. A hallucinated prose
+    # candidate such as "ومنها" must not truncate the real program's section.
+    names = [
+        p.get("name") for p in candidates
+        if p.get("name") and (p.get("__structural") or _plausible_model_entity_name(p.get("name")))
+    ]
     doc_year = _unique_document_year(document)
 
     for p in candidates:
@@ -1412,6 +1644,14 @@ def ground_programs(programs, document: str):
         if start_idx is None:
             dropped += 1
             log.warning("Dropped ungrounded item name=%r", p.get("name"))
+            continue
+
+        # When deterministic structure exists, model-only additions still need a
+        # plausible entity-shaped name. This blocks prose, quotations and citation
+        # attributions from becoming programs merely because they sit under a list.
+        if structured and not p.get("__structural") and not _plausible_model_entity_name(p.get("name")):
+            dropped += 1
+            log.warning("Dropped prose-like model candidate name=%r", p.get("name"))
             continue
 
         canonical_name = _canonical_name_from_occurrence(raw_lines, start_idx, p.get("name"))
@@ -1454,9 +1694,14 @@ def ground_programs(programs, document: str):
             item["budget"] = None
             nulled += 1
 
-        inferred_description = _infer_description(raw_lines, start_idx, hi, canonical_name)
+        inferred_description = _infer_description(raw_lines, start_idx, hi, canonical_name, other_names)
         if item.get("description") is not None and _text_is_grounded(item["description"], context):
-            pass
+            # Prefer the fuller deterministic block when the model returned only
+            # a grounded fragment of that same bounded description.
+            model_n = _norm(item["description"])
+            infer_n = _norm(inferred_description) if inferred_description else ""
+            if infer_n and model_n and _contains_token_phrase(infer_n, model_n) and len(infer_n.split()) >= len(model_n.split()) + 4:
+                item["description"] = inferred_description
         elif inferred_description:
             item["description"] = inferred_description
         elif item.get("description") is not None:
@@ -1498,6 +1743,14 @@ def ground_programs(programs, document: str):
             item["beneficiary_value"] = None
             nulled += 1
 
+        for key in ("beneficiary_value", "target_audience", "delivery_method"):
+            if _text_field_is_redundant_description(item.get(key), item.get("description")):
+                item[key] = None
+                nulled += 1
+        if item.get("delivery_method") and _description_like(item["delivery_method"]):
+            item["delivery_method"] = None
+            nulled += 1
+
         # Final presentation cleanup happens only after strict grounding.
         for key in ("name", "description", "beneficiary_value", "target_audience", "notes"):
             item[key] = _clean_display_text(item.get(key))
@@ -1505,7 +1758,7 @@ def ground_programs(programs, document: str):
 
         grounded.append(item)
 
-    log.info("grounding v8.4: structured=%s kept=%d dropped=%d nulled_fields=%d",
+    log.info("grounding v8.5: structured=%s kept=%d dropped=%d nulled_fields=%d",
              structured, len(grounded), dropped, nulled)
     return grounded, {
         "grounded_kept": len(grounded),

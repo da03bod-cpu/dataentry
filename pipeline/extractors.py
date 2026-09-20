@@ -61,6 +61,26 @@ def clean_text(text):
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+
+
+def _clean_docx_paragraph_text(text):
+    """Normalize DOCX paragraph text while preserving obvious visual columns.
+
+    Word reports often place multiple headings on one paragraph using a long run of
+    spaces.  The generic clean_text() intentionally collapses whitespace, which
+    destroys that structure.  Convert only *large* horizontal gaps/tabs to a
+    neutral column separator before normalizing the remaining whitespace.
+    """
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKC", str(text)).translate(_BIDI_CONTROLS)
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\xa0", " ")
+    # 4+ spaces or one/more tabs are layout, not ordinary word spacing.
+    text = re.sub(r"(?:\t+| {4,})", " | ", text)
+    lines = [" ".join(line.split()) for line in text.split("\n")]
+    text = "\n".join(lines)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
 def _cell(value):
     if value is None:
         return ""
@@ -193,7 +213,7 @@ def _extract_docx(path):
 
     for child in doc.element.body.iterchildren():
         if child.tag == qn("w:p"):
-            text = clean_text(Paragraph(child, doc).text)
+            text = _clean_docx_paragraph_text(Paragraph(child, doc).text)
             if text:
                 chunks.append(text)
                 seen.add(text)
@@ -216,7 +236,7 @@ def _extract_docx(path):
     # Text boxes / shapes are invisible to paragraph.text but common in Arabic reports.
     box_lines = []
     for p in doc.element.body.iter(qn("w:txbxContent")):
-        text = clean_text("".join(t.text or "" for t in p.iter(qn("w:t"))))
+        text = _clean_docx_paragraph_text("".join(t.text or "" for t in p.iter(qn("w:t"))))
         if text and text not in seen:
             seen.add(text)
             box_lines.append(text)

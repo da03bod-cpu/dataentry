@@ -380,12 +380,17 @@ def test_grounding_prefers_detail_occurrence_over_toc_and_keeps_context_fields()
         "delivery_method": "مصليات الحرم المكي الشريف", "notes": None,
     }]
     out, _ = ground_programs(pl.clean_programs(candidate), doc)
-    assert len(out) == 1
-    assert out[0]["beneficiaries_count"] == 415900
-    assert out[0]["description"] == "تقديم وجبات جافة للصائمين خلال شهر رمضان المبارك"
-    assert out[0]["target_audience"] == "ضيوف الرحمن من الرجال والنساء"
-    assert out[0]["delivery_method"] == "مصليات الحرم المكي الشريف"
-    assert out[0]["year"] == 2026
+    # v8.4 recovers other explicit entities too; it no longer throws away a
+    # source-backed item merely because the model omitted it.
+    assert [x["name"] for x in out] == ["مبادرة إفطار الصائمين", "مبادرة سقيا الحاج والمعتمر"]
+    first, second = out
+    assert first["beneficiaries_count"] == 415900
+    assert first["description"] == "تقديم وجبات جافة للصائمين خلال شهر رمضان المبارك"
+    assert first["target_audience"] == "ضيوف الرحمن من الرجال والنساء"
+    assert first["delivery_method"] == "مصليات الحرم المكي الشريف"
+    assert first["year"] == 2026
+    assert second["beneficiaries_count"] == 534640
+    assert second["delivery_method"] is None  # no leakage from the previous item
 
 
 def test_grounding_does_not_accept_toc_sequence_as_beneficiary_count():
@@ -654,3 +659,138 @@ def test_v83_cleans_common_parenthesis_and_sentence_spacing_ocr():
     assert _clean_display_text("شملت(:سجادة صلاة)") == "شملت: (سجادة صلاة)"
     assert _clean_display_text("لخدمة الحجاج والمعتمر ين.رّكّز البرنامج") == "لخدمة الحجاج والمعتمرين. رّكّز البرنامج"
     assert _clean_display_text("تقديم الهدايا لهن؛ دعًما نفسيًا") == "تقديم الهدايا لهن؛ دعمًا نفسيًا"
+
+
+# ------------------------------------------------------------------ v8.4 generalized structure parsing
+
+def test_v84_program_list_context_overrides_name_prefix_and_preserves_source_name():
+    from pipeline.grounding import ground_programs
+    doc = """التقرير السنوي 2024
+أبرز البرامج
+هي مسابقة قرآنية لتحفيز الطلاب واكتشاف المواهب :مسابقة رتل
+تأهيل وإعداد طلاب المرحلة الثانوية للإمامة في المساجد :محاريب
+برنامج حفاظ
+حلقات تعتني بالطلاب الحفاظ وتأهيلهم للإجازة بالقرآن.
+برنامج يهدف إلى تحسين التلاوة من خلال القراءة التطبيقية للدارس :تصحيح التلاوة للكبار
+"""
+    # Deliberately give the model a wrong type/prefixed name for one item.
+    candidates = pl.clean_programs([
+        {"name": "مسابقة رتل", "type": "project"},
+        {"name": "برنامج تصحيح التلاوة للكبار", "type": "project"},
+    ])
+    out, _ = ground_programs(candidates, doc)
+    assert [x["name"] for x in out] == [
+        "مسابقة رتل", "محاريب", "برنامج حفاظ", "تصحيح التلاوة للكبار"
+    ]
+    assert all(x["type"] == "program" for x in out)
+    assert out[-1]["name"] == "تصحيح التلاوة للكبار"  # no invented "برنامج" prefix
+    assert out[0]["description"].startswith("هي مسابقة قرآنية")
+    assert out[1]["description"].startswith("تأهيل وإعداد")
+
+
+def test_v84_project_list_context_classifies_prefixless_names_as_projects():
+    from pipeline.grounding import ground_programs
+    doc = """Annual Report 2025
+أبرز المشاريع
+تمكين الأسر: مشروع لدعم الأسر المنتجة وتطوير دخلها
+بناء القدرات
+مشروع تدريبي لتطوير مهارات العاملين في القطاع.
+"""
+    out, _ = ground_programs([], doc)
+    by_name = {x["name"]: x for x in out}
+    assert by_name["تمكين الأسر"]["type"] == "project"
+    assert by_name["بناء القدرات"]["type"] == "project"
+    assert by_name["تمكين الأسر"]["description"].startswith("مشروع لدعم الأسر")
+
+
+def test_v84_handles_ltr_and_rtl_colon_layouts_in_same_program_list():
+    from pipeline.grounding import ground_programs
+    doc = """التقرير السنوي 2025
+أبرز البرامج
+برنامج ألف: يقدم تدريبًا مهنيًا للشباب.
+يقدم جلسات إرشادية للأسر وورش عمل شهرية :برنامج باء
+"""
+    out, _ = ground_programs([], doc)
+    assert [x["name"] for x in out] == ["برنامج ألف", "برنامج باء"]
+    assert all(x["type"] == "program" for x in out)
+    assert "تدريبًا مهنيًا" in out[0]["description"]
+    assert "جلسات إرشادية" in out[1]["description"]
+
+
+def test_v84_english_program_list_and_unknown_model_shape_fallback():
+    from pipeline.grounding import ground_programs
+    doc = """Annual Report 2025
+Featured Programs
+Youth Skills: Provides practical training for young adults.
+Family Support
+Provides counseling and referral support for families.
+
+Special Services
+Community Desk
+A staffed help desk for beneficiaries.
+"""
+    candidates = pl.clean_programs([
+        {"name": "Community Desk", "type": "program", "description": "A staffed help desk for beneficiaries."}
+    ])
+    out, _ = ground_programs(candidates, doc)
+    by_name = {x["name"]: x for x in out}
+    assert by_name["Youth Skills"]["type"] == "program"
+    assert by_name["Family Support"]["type"] == "program"
+    # Future/unknown layout not covered by deterministic rules is retained when
+    # the model found it and strict grounding verifies the exact source text.
+    assert by_name["Community Desk"]["type"] == "program"
+
+
+def test_v84_does_not_promote_achievement_mentions_or_page_footers():
+    from pipeline.grounding import ground_programs
+    doc = """البرامج التعليمية
+برامج البنين
+أبرز البرامج
+برنامج المهرة
+برنامج يعنى بإعداد الطالب للمسابقات القرآنية وتأهيله للمنافسات المحلية والدولية.
+منجزات برنامج المهرة
+1. الطالب الأول
+المركز الثالث
+مسابقة نادي المدينة للقرآن الكريم
+2. الطالب الثاني
+المركز الأول
+مسابقة وزير الرياضة للقرآن الكريم
+30
+2024 الجمعية الخيرية | التقرير السنوي
+صفحة PDF رقم 33
+الموارد البشرية:
+"""
+    out, _ = ground_programs([], doc)
+    assert [x["name"] for x in out] == ["برامج البنين", "برنامج المهرة"]
+    assert all("مسابقة" not in x["name"] for x in out)
+    assert all("صفحة PDF" not in (x.get("description") or "") for x in out)
+
+
+def test_v84_dedupes_ocr_spacing_and_wrapped_parenthetical_titles():
+    from pipeline.grounding import ground_programs
+    doc = """15 أولا: برامج إ كرام الزائرات
+أولًا: برامج إكرام الزائرات
+وصف البرنامج.
+28 3.مبادرة ما تيسر منه (تصحيح تلاوة سورة الفاتحة)
+مبادرة ما تيسر منه
+(تصحيح تلاوة سورة الفاتحة)
+تصحيح تلاوة سورة الفاتحة للمستفيدات.
+"""
+    out, _ = ground_programs([], doc)
+    assert [x["name"] for x in out if x["type"] == "program"] == ["برامج إكرام الزائرات"]
+    projects = [x for x in out if x["type"] == "project"]
+    assert len(projects) == 1
+    assert projects[0]["name"] == "مبادرة ما تيسر منه (تصحيح تلاوة سورة الفاتحة)"
+
+
+def test_v84_report_year_can_be_dominant_even_with_historical_comparison_years():
+    from pipeline.grounding import ground_programs
+    doc = """التقرير السنوي 2024
+أبرز البرامج
+خدمة المستفيدين: برنامج يقدم الدعم للمستفيدين.
+مقارنة الأداء مع 2023 وتحضير خطة 2025.
+2024 الجمعية | التقرير السنوي
+2024 الجمعية | التقرير السنوي
+"""
+    out, _ = ground_programs([], doc)
+    assert out[0]["year"] == 2024

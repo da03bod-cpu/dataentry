@@ -794,3 +794,78 @@ def test_v84_report_year_can_be_dominant_even_with_historical_comparison_years()
 """
     out, _ = ground_programs([], doc)
     assert out[0]["year"] == 2024
+
+# ------------------------------------------------------------------ v8.5 parallel-layout / prose-guard fixes
+
+def test_v85_docx_large_horizontal_gaps_become_column_separators():
+    from pipeline.extractors import _clean_docx_paragraph_text
+    raw = "إكرام الزائرات                                           إرشاد الزائرات"
+    assert _clean_docx_paragraph_text(raw) == "إكرام الزائرات | إرشاد الزائرات"
+
+
+def test_v85_parallel_program_row_recovers_both_titles_and_drops_prose_names():
+    from pipeline.grounding import ground_programs
+    doc = """جمعية زائرات البيت الحرام
+1445 - 2023
+برامجنا
+إكرام الزائرات | إرشاد الزائرات
+توجيه وإرشاد الزائرات بمبادرات توعوية على عدة مستويات : شرعية أو صحية أو أمنية
+رعاية الزائرات
+ومنها : زيارة المرضى ومساعدتهم، والعناية بكبيرات السن ورعاية أطفال الزائرات.
+تأهيل متطوعات
+تأهيل وتدريب فرق تطوعية بلغات مختلفة لخدمة زائرات البيت الحرام، وتلبية حاجاتهم،
+وإرشادهم؛ لإتمام نسكهم على الوجه
+الصحيح.
+نسعى لإكرام زائرات البيت الحرام، وذلك بتقديم وجبات الإطعام والإفطار والسقيا.
+الحفاوةبالزائرات
+قال رسول الله صلى الله عليه وسلم حديثًا في الحفاوة بالضيف.
+أخرجه المصدر في السلسلة الصحيحة
+ولذلك نحن نسعى في جمعية زائرات البيت الحرام باستقبال وتوديع وفد الله وتقديم الهدايا لهم.
+إنجازاتنا
+"""
+    candidates = pl.clean_programs([
+        {"name": "توجيه وإرشاد الزائرات بمبادرات توعوية على عدة مستويات", "type": "program"},
+        {"name": "ومنها", "type": "program"},
+        {"name": "أخرجه المصدر في السلسلة الصحيحة", "type": "program"},
+    ])
+    out, _ = ground_programs(candidates, doc)
+    assert [x["name"] for x in out] == [
+        "إكرام الزائرات", "إرشاد الزائرات", "رعاية الزائرات",
+        "تأهيل متطوعات", "الحفاوة بالزائرات",
+    ]
+    assert all(x["type"] == "program" for x in out)
+    assert all(x["year"] == 2023 for x in out)
+    assert "شرعية أو صحية أو أمنية" in out[1]["description"]
+    assert out[2]["description"].startswith("ومنها:")
+    assert "نسعى لإكرام" in out[0]["description"]
+    assert "نسعى في جمعية" in out[-1]["description"]
+
+
+def test_v85_cover_year_beats_year_like_iban_groups():
+    from pipeline.grounding import _unique_document_year
+    doc = """جمعية خيرية
+1445 - 2023
+برامجنا
+خدمة المستفيدين
+حساباتنا البنكية
+SA528 00002 01608 01666 8003
+SA520 50000 68205 07382 9000
+"""
+    assert _unique_document_year(doc) == 2023
+
+
+def test_v85_rejects_full_description_copied_into_semantic_fields():
+    from pipeline.grounding import ground_programs
+    desc = "تأهيل وتدريب فرق تطوعية بلغات مختلفة لخدمة الزائرات وتلبية حاجاتهم وإرشادهم"
+    doc = f"""التقرير السنوي 2025
+برامجنا
+تأهيل متطوعات
+{desc}
+"""
+    candidates = pl.clean_programs([{
+        "name": "تأهيل متطوعات", "type": "program", "description": desc,
+        "beneficiary_value": desc, "delivery_method": desc,
+    }])
+    out, _ = ground_programs(candidates, doc)
+    assert out[0]["beneficiary_value"] is None
+    assert out[0]["delivery_method"] is None

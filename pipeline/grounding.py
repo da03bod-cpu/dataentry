@@ -3,12 +3,12 @@
 The LLM is a candidate extractor, not the source of truth.  Every returned
 record must be supported by text extracted from the *current* upload.
 
-v7 keeps the deterministic structure pass and adds conservative field cleanup:
+v8.4 generalizes structural recovery across heterogeneous reports and keeps conservative field cleanup:
 - reconstruct target_audience + delivery_method from wrapped RTL multi-column rows
 - prevent beneficiary_value from duplicating target_audience
 - keep all repairs bounded to the current item section
 
-v6 added a deterministic structure pass for report-style documents:
+The deterministic structure pass supports report-style documents:
 - recover top-level Arabic section headings (programs)
 - recover repeated initiative/project headings from TOC + detail pages
 - preserve canonical heading names, including prefixes such as "مبادرة"
@@ -72,13 +72,43 @@ _ORDINAL_RANK = {
 _PROJECT_PREFIXES = ("مبادرة", "مشروع", "المشروع", "مسابقة", "دورة", "ملتقى", "الدليل")
 _GENERIC_PROGRAM_HEADINGS = {
     "البرامج والمبادرات", "برامج ومبادرات", "برامج ومشاريع", "البرامج والمشاريع",
+    "البرامج التعليمية", "البرامج", "أبرز البرامج", "ابرز البرامج",
+    "قائمة البرامج", "برامجنا", "key programs", "featured programs", "programs",
 }
+
+# Generic list/container labels.  These are structural labels, not entity names.
+_PROJECT_LIST_TEXT = (
+    "أبرز المشاريع", "ابرز المشاريع", "المشاريع", "قائمة المشاريع",
+    "المبادرات", "أبرز المبادرات", "ابرز المبادرات", "projects", "initiatives",
+)
+_PROGRAM_LIST_TEXT = (
+    "أبرز البرامج", "ابرز البرامج", "قائمة البرامج", "برامجنا",
+    "featured programs", "key programs", "program list",
+)
+_ACTIVITY_LIST_TEXT = (
+    "أبرز الأنشطة", "ابرز الانشطة", "الأنشطة", "الفعاليات", "activities", "events",
+)
+
+# Strong standalone entity nouns.  Type can still be overridden by an explicit
+# source list context (e.g. "مسابقة رتل" under "أبرز البرامج" is a program).
+_PROGRAM_PREFIXES = ("برنامج", "البرنامج", "برامج")
+_PROJECT_STRONG_PREFIXES = ("مشروع", "المشروع", "مبادرة", "المبادرة")
+_FLEX_ENTITY_PREFIXES = ("مسابقة", "دورة", "ملتقى", "دليل", "الدليل", "حملة", "خدمة", "منصة", "مسار")
+
+# Common prose starts that look like entity nouns but are actually descriptions.
+_DESCRIPTION_STARTS = (
+    "برنامج يهدف", "برنامج يعنى", "برنامج يسعى", "برنامج لتعليم", "برنامج مخصص",
+    "مشروع مخصص", "مشروع يهدف", "مشروع مفتتح", "مبادرة تهدف", "دورة تدريبية مقدمة", "ملتقى يهدف",
+    "حلق تعنى", "حلقة مخصصة", "حلقات تعتني", "منصة تعليمية",
+    "program aims", "program designed", "project aims", "initiative aims",
+)
 
 
 def _norm(value) -> str:
     if value is None:
         return ""
     s = unicodedata.normalize("NFKC", str(value)).translate(_DIGITS)
+    s = s.replace("ـ", "")
     s = _DIACRITICS.sub("", s)
     s = s.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ى", "ي")
     s = _PUNCT.sub(" ", s.lower())
@@ -101,11 +131,19 @@ def _name_candidates(name: str):
 
 def _name_key(name: str) -> str:
     """Loose key used only to match a model candidate to a document heading."""
-    n = _norm(name)
+    raw = str(name or "")
+    # Remove a trailing/unfinished parenthetical subtitle before punctuation is
+    # normalized away. This collapses OCR variants like `Name`, `Name (sub...`,
+    # and `Name (subtitle)` while the displayed title keeps the fullest source form.
+    raw = re.sub(r"\s*\(.*$", "", raw).strip()
+    n = _norm(raw)
     toks = n.split()
-    if toks and toks[0] in {_norm(x) for x in _PROJECT_PREFIXES}:
+    identity_prefixes = {_norm(x) for x in (_PROJECT_PREFIXES + _PROGRAM_PREFIXES)}
+    if toks and toks[0] in identity_prefixes:
         toks = toks[1:]
-    return " ".join(toks)
+    # Compact only for identity matching. This tolerates OCR splits such as
+    # "إ كرام" vs "إكرام" without changing the displayed source title.
+    return re.sub(r"\s+", "", " ".join(toks))
 
 
 def _contains_token_phrase(haystack_norm: str, needle_norm: str) -> bool:
@@ -135,9 +173,14 @@ def _window_matches_name(norm_lines, idx: int, name: str, span: int = 3) -> bool
 
 def _strip_toc_numbering(raw: str) -> str:
     s = raw.strip().lstrip("*•-–— ")
-    # Page number + item number, e.g. "16 1.مبادرة ..." or "22 .1 مبادرة ..."
-    s = re.sub(r"^\d+\s+(?:[.\-]?\s*)?", "", s)
-    s = re.sub(r"^\.?\s*\d+\s*[.\-:]?\s*", "", s)
+    # Conservative TOC numbering only. Do not strip arbitrary metrics such as
+    # "570 مشروع ..." or "34 حملة مستفيدة".
+    m = re.match(r"^(\d{1,3})\s+(\d{1,2})\s*[.\-:]\s*", s)
+    if m:
+        return s[m.end():].strip()
+    m = re.match(r"^\.?\s*(\d{1,2})\s*[.\-:]\s*", s)
+    if m:
+        return s[m.end():].strip()
     return s.strip()
 
 
@@ -159,6 +202,15 @@ def _canonical_project_title(raw_lines, idx: int):
 
     # Reject obvious prose that happens to start with a marker.
     if n.startswith("ملتقي يهدف ") or n.startswith("دورة تدريبية ") or n.startswith("دوره تدريبيه "):
+        return None
+    # In RTL extraction, `description :Title` can start with words such as
+    # "مشروع مخصص...". If the line has a plausible short title after the colon,
+    # the left side is prose and must not become a second entity.
+    if any(c in raw for c in (":", "：")):
+        after = re.split(r"[:：]", raw)[-1].strip()
+        if after and _title_score(after) >= 1 and _description_like(re.split(r"[:：]", raw)[0]):
+            return None
+    if _description_like(raw):
         return None
 
     title = " ".join(raw.split())
@@ -182,7 +234,7 @@ def _canonical_program_title(raw: str):
         return None
 
     # OCR of two-column TOCs can concatenate two section headings onto one line.
-    if sum(tok in _ORDINALS_NORM for tok in toks) > 1:
+    if sum(tok in _ORDINALS_NORM for tok in toks) > 1 or toks.count(_norm("برامج")) > 1:
         return None
 
     if ":" in stripped:
@@ -203,17 +255,48 @@ def _canonical_program_title(raw: str):
     return title
 
 
-def _occurrence_score(raw_lines, norm_lines, idx: int) -> int:
-    after = "\n".join(raw_lines[idx:min(len(raw_lines), idx + 20)])
-    after_n = _norm(after)
+def _occurrence_score(raw_lines, norm_lines, idx: int, name: str | None = None) -> int:
     score = 0
-    score += 6 * sum(1 for h in _FIELD_HINTS if _norm(h) in after_n)
     raw = raw_lines[idx].strip()
-    if re.match(r"^\d+\s+(?:\d+[.\-]?\s*)?(?:مبادرة|مشروع|برنامج|مسابقة|دورة|ملتقى|الدليل)", raw):
+    n = norm_lines[idx]
+
+    if name:
+        name_n = _norm(name)
+        stripped_n = _norm(_strip_toc_numbering(raw))
+        canon_proj = _canonical_project_title(raw_lines, idx)
+        canon_prog = _canonical_program_title(raw)
+        if (canon_proj and _name_key(canon_proj) == _name_key(name)) or (canon_prog and _name_key(canon_prog) == _name_key(name)):
+            score += 24
+        elif stripped_n == name_n:
+            score += 24
+        elif _contains_token_phrase(n, name_n):
+            # Mention inside a longer sentence is weaker than an exact heading.
+            extra = max(0, len(n.split()) - len(name_n.split()))
+            score += max(0, 8 - min(extra, 8))
+
+    # Read local evidence only until a page/section boundary so fields on the next
+    # page cannot make a passing mention look like a detailed entity section.
+    evidence = []
+    for j in range(idx, min(len(raw_lines), idx + 20)):
+        if j > idx and (_is_page_artifact(raw_lines[j]) or _looks_like_major_section_heading(raw_lines[j])):
+            break
+        evidence.append(raw_lines[j])
+    after_n = _norm("\n".join(evidence))
+    score += 5 * sum(1 for h in _FIELD_HINTS if _norm(h) in after_n)
+
+    if re.match(r"^\d{1,3}\s+\d{1,2}[.\-:]\s*(?:مبادرة|مشروع|برنامج|مسابقة|دورة|ملتقى|الدليل)", raw):
         score -= 12
-    if re.match(r"^\d+\s+\d+[.]", raw):
-        score -= 8
-    score += min(idx, 10000) // 1000
+    if _nearest_list_type(raw_lines, idx):
+        score += 8
+    # Nearby program-list heading below a parent container is good evidence.
+    for j in range(idx + 1, min(len(raw_lines), idx + 25)):
+        if _is_page_artifact(raw_lines[j]):
+            continue
+        if _list_context_from_heading(raw_lines[j]):
+            score += 8
+            break
+        if _looks_like_major_section_heading(raw_lines[j]) and j > idx + 1:
+            break
     return score
 
 
@@ -251,58 +334,393 @@ def _find_best_occurrence(document: str, name: str):
     if not hits:
         return None, None, None, raw_lines, norm_lines
 
-    best_idx = max(dict.fromkeys(hits), key=lambda i: (_occurrence_score(raw_lines, norm_lines, i), i))
+    best_idx = max(dict.fromkeys(hits), key=lambda i: (_occurrence_score(raw_lines, norm_lines, i, name), i))
     return name, raw_lines[best_idx], best_idx, raw_lines, norm_lines
 
 
-def _discover_structure(document: str):
-    """Discover report structure without trusting the model.
+def _is_page_artifact(raw: str) -> bool:
+    """Recognize page labels/footers without knowing the organization name."""
+    text = " ".join(str(raw or "").split())
+    n = _norm(text)
+    if not n:
+        return False
+    if re.search(r"صفح(?:ة|ه)\s*pdf\s*رقم\s*\d+", n):
+        return True
+    if re.search(r"page\s*\d+(?:\s*of\s*\d+)?$", n, re.I):
+        return True
+    # Annual-report footers commonly combine a year, organization and "annual report".
+    if "التقرير السنوي" in n and any(ch.isdigit() for ch in n):
+        return True
+    if "annual report" in n and any(ch.isdigit() for ch in n):
+        return True
+    return False
 
-    Structured mode is intentionally conservative: it activates only when there
-    are at least two ordinal section headings and at least three project headings
-    repeated in the document (typically TOC + detail page).  That prevents prose
-    in arbitrary text/spreadsheets from being misread as a hierarchy.
+
+def _is_short_heading(raw: str) -> bool:
+    text = " ".join(str(raw or "").strip().lstrip("*•-–— ").split())
+    if not text or len(text) > 140:
+        return False
+    n = _norm(text)
+    if not n or _is_page_artifact(text):
+        return False
+    words = n.split()
+    if len(words) > 12:
+        return False
+    # A heading generally does not look like a full prose sentence.
+    if text.count(".") >= 2 or text.count("؛") >= 2:
+        return False
+    return True
+
+
+def _list_context_from_heading(raw: str):
+    """Return source-declared item type for list headings, else None."""
+    n = _norm(raw)
+    if not n or not _is_short_heading(raw):
+        return None
+    if any(n == _norm(x) or n.startswith(_norm(x) + " ") for x in _PROGRAM_LIST_TEXT):
+        return "program"
+    if any(n == _norm(x) or n.startswith(_norm(x) + " ") for x in _PROJECT_LIST_TEXT):
+        return "project"
+    # Activities/events have no separate schema type; treat independently named
+    # activities as projects unless the document itself places them under programs.
+    if any(n == _norm(x) or n.startswith(_norm(x) + " ") for x in _ACTIVITY_LIST_TEXT):
+        return "project"
+    return None
+
+
+def _looks_like_major_section_heading(raw: str) -> bool:
+    """Generic section boundary used to stop a prior list context."""
+    text = " ".join(str(raw or "").strip().split())
+    if not _is_short_heading(text):
+        return False
+    n = _norm(text)
+    if _list_context_from_heading(text):
+        return False
+    # Colon at either visual edge is common after RTL extraction.
+    if text.startswith((":", "：")) or text.endswith((":", "：")):
+        return True
+    # Broad report-section nouns; do not require a particular organization/report.
+    section_starts = (
+        "منجزات", "إنجازات", "انجازات", "نتائج",
+        "الموارد البشرية", "الحوكمة", "التقرير المالي", "الشراكات", "الاستدامة المالية",
+        "مجلس الادارة", "مؤشرات الاداء", "الهيكل التنظيمي", "فروع الجمعية", "الاتصال",
+        "تقنية المعلومات", "من نحن", "رؤية ورسالة", "الادارات النسائية",
+        "human resources", "governance", "financial report", "partnerships", "contents",
+    )
+    return any(n.startswith(_norm(x)) for x in section_starts)
+
+
+def _description_like(text: str) -> bool:
+    n = _norm(text)
+    if not n:
+        return False
+    if any(n.startswith(_norm(x)) for x in _DESCRIPTION_STARTS) or len(n.split()) >= 13:
+        return True
+    if any(c in str(text) for c in ("،", ";", "؛")) and len(n.split()) >= 6:
+        return True
+    # Generic descriptive verbs near the start are a strong signal that a line is
+    # prose rather than an entity heading (e.g. "دليل إرشادي شامل يضم ...").
+    toks = n.split()
+    early = set(toks[:7])
+    verbs = {_norm(x) for x in (
+        "يهدف", "تهدف", "يعنى", "تعنى", "يسعى", "تسعى", "يقدم", "تقدم",
+        "يضم", "تضم", "يحتوي", "تحتوي", "مخصص", "مخصصة", "مقدمة", "مقدم",
+        "لتعليم", "لتحسين", "لتأهيل", "لتقديم", "لاعداد", "لإعداد",
+    )}
+    if early & verbs:
+        return True
+    if n.startswith(_norm("دورة تدريبية ")) and len(toks) >= 3:
+        return True
+    return False
+
+
+def _title_score(text: str) -> int:
+    """Heuristic score for a short entity title fragment around a colon."""
+    t = " ".join(str(text or "").strip().lstrip("*•-–— ").split())
+    n = _norm(t)
+    if not t or not n or _is_page_artifact(t):
+        return -99
+    words = n.split()
+    score = 0
+    if len(words) <= 4:
+        score += 5
+    elif len(words) <= 8:
+        score += 3
+    elif len(words) <= 12:
+        score += 1
+    else:
+        score -= 6
+    if len(t) <= 90:
+        score += 2
+    if any(n.startswith(_norm(x) + " ") or n == _norm(x) for x in _PROGRAM_PREFIXES + _PROJECT_STRONG_PREFIXES + _FLEX_ENTITY_PREFIXES):
+        score += 3
+    if _description_like(t):
+        score -= 7
+    if any(_norm(h) == n for h in _FIELD_HINTS):
+        score -= 8
+    if n in {_norm(x) for x in _GENERIC_PROGRAM_HEADINGS}:
+        score -= 8
+    return score
+
+
+def _inline_title_description(raw: str, forced_type=None):
+    """Parse either `title: description` or RTL-extracted `description :title`."""
+    text = " ".join(str(raw or "").strip().split())
+    if not text or not any(c in text for c in (":", "：")):
+        return None
+    # Evaluate every separator; OCR can leave other colons inside prose.
+    best = None
+    for m in re.finditer(r"[:：]", text):
+        left, right = text[:m.start()].strip(), text[m.end():].strip()
+        for title, desc in ((left, right), (right, left)):
+            if not title:
+                continue
+            score = _title_score(title)
+            if forced_type and score >= 0:
+                score += 3
+            # Prefer an opposite side that actually looks descriptive, while still
+            # allowing a bare `name:` heading with no same-line description.
+            if desc and (_description_like(desc) or len(_norm(desc).split()) >= 5):
+                score += 2
+            if best is None or score > best[0]:
+                best = (score, title, desc or None)
+    if not best or best[0] < (1 if forced_type else 4):
+        return None
+    title = _strip_toc_numbering(best[1]).strip(" :：.-–—")
+    if not title or len(title) > 180:
+        return None
+    return title, best[2]
+
+
+def _standalone_entity(raw: str, forced_type=None):
+    """Recognize a short standalone entity heading without interpreting prose."""
+    text = _strip_toc_numbering(str(raw or "")).strip(" :：.-–—")
+    if not _is_short_heading(text):
+        return None
+    n = _norm(text)
+    if not n or _description_like(text) or re.fullmatch(r"\d+(?:[.,]\d+)?", n):
+        return None
+    prefix_norms = {_norm(x) for x in _PROGRAM_PREFIXES + _PROJECT_STRONG_PREFIXES + _FLEX_ENTITY_PREFIXES}
+    if sum(tok in prefix_norms for tok in n.split()) > 1:
+        return None
+    # Two-column TOCs often concatenate another numbered entity later on the line.
+    if re.search(r"\s\d{1,2}\s*[.]\s*(?:مبادرة|مشروع|برنامج|مسابقة|دورة|ملتقى|الدليل)", text):
+        return None
+    if n in {_norm(x) for x in _GENERIC_PROGRAM_HEADINGS}:
+        return None
+    if any(n.startswith(_norm(x) + " ") or n == _norm(x) for x in _PROGRAM_PREFIXES):
+        if forced_type is None:
+            # Deterministic recovery is conservative outside a declared list; the
+            # LLM can still contribute longer unusual names and grounding verifies them.
+            if len(n.split()) > 5 or re.search(r"\d", n):
+                return None
+        return text, "program"
+    if any(n.startswith(_norm(x) + " ") or n == _norm(x) for x in _PROJECT_STRONG_PREFIXES):
+        return text, forced_type or "project"
+    if forced_type and any(n.startswith(_norm(x) + " ") or n == _norm(x) for x in _FLEX_ENTITY_PREFIXES):
+        return text, forced_type
+    if forced_type:
+        # Inside an explicit source list, short names need no lexical prefix.
+        return text, forced_type
+    return None
+
+
+def _nearest_list_type(raw_lines, idx: int, lookback: int = 80):
+    """Find the nearest explicit list heading without crossing a major section."""
+    for j in range(idx - 1, max(-1, idx - lookback) - 1, -1):
+        raw = raw_lines[j]
+        if _is_page_artifact(raw) or not raw.strip():
+            continue
+        typ = _list_context_from_heading(raw)
+        if typ:
+            return typ
+        if _looks_like_major_section_heading(raw):
+            return None
+    return None
+
+
+def _program_group_title(raw: str, raw_lines=None, idx=None):
+    """Recover parent program/group titles only with structural evidence."""
+    text = _strip_toc_numbering(str(raw or "")).strip(" :：.-–—")
+    if not _is_short_heading(text):
+        return None
+    n = _norm(text)
+    if not n or n in {_norm(x) for x in _GENERIC_PROGRAM_HEADINGS} or _description_like(text):
+        return None
+    if len(n.split()) > 7 or any(c in text for c in ("،", ";", "؛")):
+        return None
+
+    starts_programs = n.startswith(_norm("برامج") + " ")
+    starts_program = n.startswith(_norm("برنامج") + " ")
+    starts_container = any(n.startswith(_norm(x) + " ") for x in ("منصة", "مسار", "حزمة"))
+    if not (starts_programs or starts_program or starts_container):
+        return None
+
+    if raw_lines is None or idx is None:
+        return text if starts_programs or starts_program else None
+
+    # Strong source-structure evidence: a nested program list appears soon after.
+    for k in range(idx + 1, min(len(raw_lines), idx + 35)):
+        if _list_context_from_heading(raw_lines[k]) == "program":
+            return text
+        if _looks_like_major_section_heading(raw_lines[k]) and k > idx + 1:
+            break
+
+    # A single named program can also be a heading when it is nested beneath a
+    # program-family heading immediately above (e.g. Programs > Program X).
+    if starts_program:
+        for k in range(idx - 1, max(-1, idx - 10), -1):
+            if _is_page_artifact(raw_lines[k]) or not raw_lines[k].strip():
+                continue
+            prev_n = _norm(raw_lines[k])
+            if prev_n.startswith(_norm("برامج") + " ") or _list_context_from_heading(raw_lines[k]) == "program":
+                return text
+            if _looks_like_major_section_heading(raw_lines[k]):
+                break
+
+    return None
+
+
+def _generic_item_at_line(raw_lines, idx: int, list_type=None):
+    raw = raw_lines[idx]
+    inline = _inline_title_description(raw, forced_type=list_type)
+    if inline:
+        title, _desc = inline
+        ent = _standalone_entity(title, forced_type=list_type)
+        if ent:
+            return ent[0], ent[1]
+
+    # Explicit lexical headings can stand alone anywhere.
+    explicit = _standalone_entity(raw, forced_type=None)
+    if explicit:
+        return explicit
+
+    if list_type:
+        # Prefixless names are common inside `أبرز البرامج`. Do not accept every
+        # short continuation line: require evidence that the next meaningful line
+        # behaves like a description, field, or inline next structure.
+        tentative = _standalone_entity(raw, forced_type=list_type)
+        if not tentative or _description_like(raw):
+            return None
+        n = _norm(tentative[0])
+        if n.startswith((_norm("وذلك"), _norm("حيث"), _norm("ضمن"), _norm("حتى"), _norm("مع "))):
+            return None
+        next_raw = None
+        for j in range(idx + 1, min(len(raw_lines), idx + 4)):
+            if not raw_lines[j].strip() or _is_page_artifact(raw_lines[j]):
+                continue
+            next_raw = raw_lines[j]
+            break
+        if next_raw is None:
+            return None
+        if _inline_title_description(next_raw, forced_type=list_type):
+            # A bare title immediately followed by another item is suspicious;
+            # usually the current line is a wrapped continuation.
+            return None
+        if _description_like(next_raw) or len(_norm(next_raw).split()) >= 6 or any(_norm(h) in _norm(next_raw) for h in _FIELD_HINTS):
+            return tentative
+    return None
+
+
+def _discover_structure(document: str):
+    """Discover high-confidence entities from heterogeneous report layouts.
+
+    Recovery uses source-declared structure (ordinal sections, program/project
+    list headings, inline `name: description` pairs, short standalone headings,
+    and explicit entity nouns). It is deliberately a supplement to the model,
+    not a replacement: model candidates are unioned later and still must pass
+    strict grounding against the current document.
     """
     raw_lines = document.splitlines()
     norm_lines = [_norm(x) for x in raw_lines]
+    found = OrderedDict()
 
-    programs = OrderedDict()
-    program_meta = {}
+    def add(title, typ, idx, confidence=1, ordinal_rank=None):
+        title = " ".join(str(title or "").split()).strip()
+        if not title or typ not in {"program", "project"}:
+            return
+        key = _name_key(title) or _norm(title)
+        if not key:
+            return
+        prev = found.get(key)
+        item = {"title": title, "type": typ, "idx": idx, "confidence": confidence, "ordinal_rank": ordinal_rank}
+        if prev is None or (confidence, len(_norm(title)), -idx) > (prev["confidence"], len(_norm(prev["title"])), -prev["idx"]):
+            found[key] = item
+        elif prev is not None and prev.get("ordinal_rank") is None and ordinal_rank is not None:
+            prev["ordinal_rank"] = ordinal_rank
+
+    # Preserve the proven ordinal-section recovery from earlier versions.
     for i, raw in enumerate(raw_lines):
         title = _canonical_program_title(raw)
         if title:
-            key = _norm(title)
             first_tok = _norm(raw.strip().lstrip("*•-–— ")).split()[:1]
-            rank = _ORDINAL_RANK.get(first_tok[0], 999) if first_tok else 999
-            if key not in program_meta or (rank, i) < (program_meta[key][0], program_meta[key][1]):
-                program_meta[key] = (rank, i, title)
-    for key, (_rank, _idx, title) in sorted(program_meta.items(), key=lambda kv: (kv[1][0], kv[1][1])):
-        programs[key] = title
+            rank = _ORDINAL_RANK.get(first_tok[0]) if first_tok else None
+            add(title, "program", i, 5, ordinal_rank=rank)
+        group = _program_group_title(raw, raw_lines, i)
+        if group:
+            add(group, "program", i, 4)
 
+    # Explicit project/initiative headings remain valid outside list contexts,
+    # but flexible nouns such as competition/course/forum need detail evidence so
+    # references inside an achievements section are not promoted to entities.
     project_occ = OrderedDict()
+    strong_norms = {_norm(x) for x in _PROJECT_STRONG_PREFIXES}
     for i in range(len(raw_lines)):
         title = _canonical_project_title(raw_lines, i)
         if not title:
             continue
         key = _name_key(title)
-        bucket = project_occ.setdefault(key, {"title": title, "indexes": []})
-        bucket["indexes"].append(i)
-        # Prefer the more complete title variant (useful for parenthetical subtitles).
-        if len(_norm(title)) > len(_norm(bucket["title"])):
-            bucket["title"] = title
-
-    repeated = []
+        project_occ.setdefault(key, {"title": title, "indexes": []})["indexes"].append(i)
     for bucket in project_occ.values():
-        # Exact repeated heading or a high-confidence detailed heading with fields.
-        uniq = list(dict.fromkeys(bucket["indexes"]))
-        detail_score = max((_occurrence_score(raw_lines, norm_lines, i) for i in uniq), default=0)
-        if len(uniq) >= 2 or detail_score >= 18:
-            repeated.append(bucket["title"])
+        title, indexes = bucket["title"], list(dict.fromkeys(bucket["indexes"]))
+        first_tok = _norm(title).split()[:1]
+        is_strong = bool(first_tok and first_tok[0] in strong_norms)
+        best_idx = max(indexes, key=lambda i: (_occurrence_score(raw_lines, norm_lines, i, title), i))
+        list_type = _nearest_list_type(raw_lines, best_idx)
+        detail_score = _occurrence_score(raw_lines, norm_lines, best_idx, None)
+        strong_supported = is_strong and (len(indexes) >= 2 or detail_score >= 5)
+        flexible_supported = detail_score >= 10 or (len(indexes) >= 2 and detail_score >= 5)
+        if list_type or strong_supported or flexible_supported:
+            add(title, list_type or "project", best_idx, 5 if list_type else 4)
 
-    structured = len(programs) >= 2 and len(repeated) >= 3
-    if not structured:
-        return [], [], False
-    return list(programs.values()), repeated, True
+    # Generic list-aware pass. Context is reset by real section headings, but page
+    # artifacts do not reset it because lists frequently continue across pages.
+    active_type = None
+    for i, raw in enumerate(raw_lines):
+        if _is_page_artifact(raw) or not raw.strip():
+            continue
+        ctx = _list_context_from_heading(raw)
+        if ctx:
+            active_type = ctx
+            continue
+        if _looks_like_major_section_heading(raw):
+            active_type = None
+            continue
+
+        # The generic pass is list-aware by design. Outside an explicit list,
+        # conservative prefix recovery is handled above and future unusual layouts
+        # are supplied by the model + strict grounding. This avoids promoting
+        # financial-note mentions such as "مشروع كفالة..." into execution records.
+        if active_type is None:
+            continue
+        ent = _generic_item_at_line(raw_lines, i, active_type)
+        if not ent:
+            continue
+        title, typ = ent
+        add(title, typ, i, 5)
+
+    vals = list(found.values())
+    programs = [x for x in vals if x["type"] == "program"]
+    projects = [x for x in vals if x["type"] == "project"]
+    if sum(x.get("ordinal_rank") is not None for x in programs) >= 2:
+        programs.sort(key=lambda x: (x.get("ordinal_rank") is None, x.get("ordinal_rank") or 999, x["idx"]))
+    else:
+        programs.sort(key=lambda x: x["idx"])
+    projects.sort(key=lambda x: x["idx"])
+    items = programs + projects
+    # Even one explicit program heading is useful; no brittle "2 sections + 3
+    # repeated projects" gate is required. Grounding later removes false positives.
+    return items, bool(items)
 
 
 def _blank_record(name: str, typ: str):
@@ -322,24 +740,31 @@ def _best_candidate(candidates, title):
 
 
 def _augment_from_structure(programs, document: str):
-    section_titles, project_titles, structured = _discover_structure(document)
+    discovered, structured = _discover_structure(document)
     if not structured:
         return list(programs or []), False
 
-    out = []
-    for title in section_titles:
-        base = dict(_best_candidate(programs or [], title) or _blank_record(title, "program"))
+    out, seen = [], set()
+    for spec in discovered:
+        title, typ = spec["title"], spec["type"]
+        base = dict(_best_candidate(programs or [], title) or _blank_record(title, typ))
         base["name"] = title
-        base["type"] = "program"
+        base["type"] = typ
         out.append(base)
-    for title in project_titles:
-        base = dict(_best_candidate(programs or [], title) or _blank_record(title, "project"))
-        base["name"] = title
-        base["type"] = "project"
-        out.append(base)
+        seen.add(_name_key(title))
 
-    log.info("structural recovery: programs=%d projects=%d (model_candidates=%d)",
-             len(section_titles), len(project_titles), len(programs or []))
+    # Generalization rule: deterministic recovery supplements model extraction.
+    # Never throw away a model candidate merely because a future document uses a
+    # structure we did not anticipate; strict grounding will still verify it.
+    for p in programs or []:
+        key = _name_key(p.get("name"))
+        if key and key not in seen:
+            out.append(dict(p))
+            seen.add(key)
+
+    log.info("structural recovery: discovered=%d (programs=%d projects=%d) model_candidates=%d union=%d",
+             len(discovered), sum(x["type"] == "program" for x in discovered),
+             sum(x["type"] == "project" for x in discovered), len(programs or []), len(out))
     return out, True
 
 
@@ -420,6 +845,8 @@ def _semantic_numbers_after_labels(evidence: str, labels, max_follow_lines: int 
 
         for j in range(i + 1, min(len(lines), i + max_follow_lines + 1)):
             next_n = norm_lines[j]
+            if _is_page_artifact(lines[j]) or next_n == _norm("التقرير") or re.fullmatch(r"ف\s*\d+", next_n):
+                break
             if j > i + 1 and any(_norm(h) in next_n for h in _FIELD_HINTS):
                 break
             raw_next = unicodedata.normalize("NFKC", lines[j]).translate(_DIGITS).strip()
@@ -433,13 +860,38 @@ def _semantic_numbers_after_labels(evidence: str, labels, max_follow_lines: int 
 
 
 def _unique_document_year(document: str):
-    years = []
-    for n in _numbers(document):
-        if float(n).is_integer() and 1900 <= int(n) <= 2100:
-            y = int(n)
-            if y not in years:
-                years.append(y)
-    return years[0] if len(years) == 1 else None
+    """Infer a report-wide Gregorian year conservatively.
+
+    Prefer an explicit annual/report year. Otherwise use a strongly dominant year
+    rather than requiring the document to contain no historical comparison years.
+    """
+    text = unicodedata.normalize("NFKC", document or "").translate(_DIGITS)
+    explicit = []
+    patterns = (
+        r"(?:التقرير\s+(?:السنوي|النصف\s+سنوي)|تقرير\s+الأعمال[^\n]{0,40}?لعام)\D{0,20}(20\d{2})",
+        r"(?:annual\s+report|report\s+for)\D{0,20}(20\d{2})",
+    )
+    for pat in patterns:
+        explicit.extend(int(x) for x in re.findall(pat, text, flags=re.I))
+    if explicit:
+        from collections import Counter
+        c = Counter(explicit)
+        year, count = c.most_common(1)[0]
+        if count >= 1:
+            return year
+
+    from collections import Counter
+    years = [int(n) for n in _numbers(text) if float(n).is_integer() and 1900 <= int(n) <= 2100]
+    if not years:
+        return None
+    c = Counter(years)
+    ranked = c.most_common(2)
+    if len(ranked) == 1:
+        return ranked[0][0]
+    (y1, c1), (_y2, c2) = ranked
+    if c1 >= 3 and c1 >= c2 * 2:
+        return y1
+    return None
 
 
 def _number_near_labels(value, evidence: str, labels, lookahead_lines: int = 5) -> bool:
@@ -454,29 +906,51 @@ def _number_near_labels(value, evidence: str, labels, lookahead_lines: int = 5) 
 
 
 def _canonical_name_from_occurrence(raw_lines, idx: int, fallback: str):
+    # Prefer structural title parsers that can join wrapped parenthetical subtitles
+    # before the generic short-title parser.
     proj = _canonical_project_title(raw_lines, idx)
     if proj and _name_key(proj) == _name_key(fallback):
         return proj
     prog = _canonical_program_title(raw_lines[idx])
     if prog and _name_key(prog) == _name_key(fallback):
         return prog
+    group = _program_group_title(raw_lines[idx], raw_lines, idx)
+    if group and _name_key(group) == _name_key(fallback):
+        return group
+    list_type = _nearest_list_type(raw_lines, idx)
+    generic = _generic_item_at_line(raw_lines, idx, list_type)
+    if generic and _name_key(generic[0]) == _name_key(fallback):
+        return generic[0]
     return fallback
 
 
 def _ground_type(current_type, raw_lines, idx: int, canonical_name: str):
-    proj = _canonical_project_title(raw_lines, idx)
-    if proj and _name_key(proj) == _name_key(canonical_name):
-        return "project"
+    # Source-declared list semantics outrank lexical prefixes. Example: a report
+    # can list "مسابقة رتل" under "أبرز البرامج"; it must remain a program.
+    list_type = _nearest_list_type(raw_lines, idx)
+    if list_type:
+        return list_type
+
     prog = _canonical_program_title(raw_lines[idx])
     if prog and _name_key(prog) == _name_key(canonical_name):
         return "program"
-    # Unstructured fallback: only trust explicit words on/around the title line.
-    title_n = _window_norm([_norm(x) for x in raw_lines], idx, 2)
-    first = _norm(canonical_name).split()[:1]
-    if first and first[0] in {_norm(x) for x in _PROJECT_PREFIXES}:
-        return "project"
-    if _norm(canonical_name).startswith("برنامج ") or _norm(canonical_name).startswith("برامج "):
+    group = _program_group_title(raw_lines[idx], raw_lines, idx)
+    if group and _name_key(group) == _name_key(canonical_name):
         return "program"
+
+    n = _norm(canonical_name)
+    if any(n.startswith(_norm(x) + " ") or n == _norm(x) for x in _PROGRAM_PREFIXES):
+        return "program"
+    if any(n.startswith(_norm(x) + " ") or n == _norm(x) for x in _PROJECT_STRONG_PREFIXES):
+        return "project"
+
+    proj = _canonical_project_title(raw_lines, idx)
+    if proj and _name_key(proj) == _name_key(canonical_name):
+        return "project"
+
+    # Flexible nouns (competition/course/forum/etc.) are ambiguous without a list
+    # context, so keep the model/deterministic type only when the title is grounded.
+    title_n = _window_norm([_norm(x) for x in raw_lines], idx, 2)
     if current_type in {"program", "project"} and _line_matches_name(title_n, canonical_name):
         return current_type
     return None
@@ -493,15 +967,32 @@ def _starts_name_window(norm_lines, idx: int, name: str, span: int = 3) -> bool:
     return bool(needed and sum(1 for t in tokens if t in line_tokens) >= needed)
 
 
-def _context_bounds(raw_lines, norm_lines, start_idx: int, all_names, max_lines: int = 45):
-    # Include a couple of preceding lines so a table row can inherit its column
-    # headers, while description inference still starts exactly at start_idx.
-    lo = max(0, start_idx - 2)
+def _context_bounds(raw_lines, norm_lines, start_idx: int, all_names, max_lines: int = 60):
+    # Include preceding lines only when they look like actual table/field headers.
+    # Blindly taking two prior lines can leak the previous item's values into the
+    # current item in sequential report layouts.
+    lo = start_idx
+    for j in range(max(0, start_idx - 2), start_idx):
+        n = norm_lines[j]
+        hint_count = sum(1 for h in _FIELD_HINTS if _norm(h) in n)
+        if "|" in raw_lines[j] or hint_count >= 2:
+            lo = j
+            break
     hi = min(len(raw_lines), start_idx + max_lines)
     current_key = _name_key(all_names[0]) if all_names else ""
+    current_list = _nearest_list_type(raw_lines, start_idx)
     for j in range(start_idx + 1, hi):
-        # Report page footer is a reliable hard boundary in extracted annual reports.
-        if norm_lines[j] == "التقرير" and j > start_idx + 1:
+        if _is_page_artifact(raw_lines[j]):
+            # Page artifacts are excluded from evidence but not always a hard
+            # boundary; a list may continue on the next page.
+            continue
+        # A new explicit section ends this entity unless it is merely the same
+        # list heading repeated on a continuation page.
+        if _looks_like_major_section_heading(raw_lines[j]):
+            hi = j
+            return lo, hi
+        ctx = _list_context_from_heading(raw_lines[j])
+        if ctx and ctx != current_list and j > start_idx + 1:
             hi = j
             return lo, hi
         for other in all_names[1:]:
@@ -510,11 +1001,49 @@ def _context_bounds(raw_lines, norm_lines, start_idx: int, all_names, max_lines:
             if _starts_name_window(norm_lines, j, other, span=3):
                 hi = j
                 return lo, hi
+        # Generic inline/standalone next item catches names the model did not emit.
+        ent = _generic_item_at_line(raw_lines, j, current_list)
+        if ent and _name_key(ent[0]) != current_key:
+            hi = j
+            return lo, hi
     return lo, hi
+
+
+def _inline_description_for_name(raw: str, canonical_name: str):
+    parsed = _inline_title_description(raw, forced_type=None)
+    if not parsed:
+        # In a list, otherwise-prefixless titles still need parsing.
+        parsed = _inline_title_description(raw, forced_type="program") or _inline_title_description(raw, forced_type="project")
+    if not parsed:
+        return None
+    title, desc = parsed
+    if _name_key(title) != _name_key(canonical_name):
+        return None
+    cleaned = " ".join((desc or "").split()) or None
+    if cleaned and _norm(cleaned) in _ORDINALS_NORM:
+        return None
+    return cleaned
+
+
+def _looks_like_detail_list_start(raw: str) -> bool:
+    text = " ".join(str(raw or "").strip().split())
+    if not text:
+        return False
+    # Numbered achievements/people after a short program description.
+    if re.match(r"^(?:[.\-]?\s*\d{1,2}\s*[.)\-:]|\d{1,2}\s+)", text):
+        return True
+    if re.search(r"[.\s]\d{1,2}$", text):
+        return True
+    n = _norm(text)
+    return n.startswith(_norm("المركز الاول")) or n.startswith(_norm("المركز الثاني")) or n.startswith(_norm("المركز الثالث"))
 
 
 def _infer_description(raw_lines, start_idx: int, hi: int, canonical_name: str):
     out = []
+    inline = _inline_description_for_name(raw_lines[start_idx], canonical_name)
+    if inline:
+        out.append(inline)
+
     j = start_idx + 1
     # Parenthetical subtitle may be the second line of the heading.
     if j < hi:
@@ -522,18 +1051,32 @@ def _infer_description(raw_lines, start_idx: int, hi: int, canonical_name: str):
         if nxt.startswith("(") and ")" in nxt and _norm(nxt) in _norm(canonical_name):
             j += 1
 
+    current_list = _nearest_list_type(raw_lines, start_idx)
     for k in range(j, hi):
         raw = " ".join(raw_lines[k].strip().split())
-        if not raw:
+        if not raw or _is_page_artifact(raw):
             continue
         n = _norm(raw)
-        if n == "التقرير" or re.fullmatch(r"ف\s*\d+", n):
+        if n == _norm("التقرير") or re.fullmatch(r"ف\s*\d+", n):
+            break
+        if re.fullmatch(r"\d{1,3}", n):
             continue
         if any(_norm(h) in n for h in _FIELD_HINTS):
             break
-        # Defensive stop if a new structural heading slips past the context bound.
-        if k > j and (_canonical_project_title(raw_lines, k) or _canonical_program_title(raw_lines[k])):
+        if n in {_norm("الإجمالي"), _norm("الإجاملي"), _norm("اجمالي"), _norm("اجاملي"), _norm("المجموع"), _norm("total")} or n.startswith(_norm("عدد ")):
             break
+        if _looks_like_major_section_heading(raw) or _list_context_from_heading(raw):
+            break
+        ent = _generic_item_at_line(raw_lines, k, current_list)
+        if ent and _name_key(ent[0]) != _name_key(canonical_name):
+            break
+        # Avoid swallowing achievement/person lists after a completed standalone
+        # description (common in annual reports).
+        if out and _looks_like_detail_list_start(raw):
+            break
+        # If the current line itself is the title occurrence, do not echo it.
+        if _line_matches_name(_norm(raw), canonical_name) and len(_norm(raw).split()) <= len(_norm(canonical_name).split()) + 1:
+            continue
         out.append(raw)
 
     text = " ".join(out).strip()
@@ -785,6 +1328,12 @@ _OCR_DISPLAY_FIXES = (
     (re.compile(r"نم\s+اذج"), "نماذج"),
     (re.compile(r"فر\s+ق"), "فرق"),
     (re.compile(r"ب\s+فاعلية"), "بفاعلية"),
+    (re.compile(r"\bالتلقني\b"), "التلقين"),
+    (re.compile(r"\bالصغري\b"), "الصغير"),
+    (re.compile(r"\bالقرآين\b"), "القرآني"),
+    (re.compile(r"\bتحسني\b"), "تحسين"),
+    (re.compile(r"\bغري\b"), "غير"),
+    (re.compile(r"اءّالقر"), "القراء"),
 )
 
 
@@ -792,12 +1341,13 @@ def _clean_display_text(value):
     """Clean only obvious OCR/spacing artefacts after grounding."""
     if value is None:
         return None
-    s = unicodedata.normalize("NFKC", str(value))
+    s = unicodedata.normalize("NFKC", str(value)).replace("ـ", "")
     # Remove a stray Arabic combining mark that OCR leaves after whitespace,
     # e.g. "مبادرة ُسلوان". Do not strip valid marks inside words.
     s = re.sub(r"(^|\s)[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]+", r"\1", s)
     for pattern, repl in _OCR_DISPLAY_FIXES:
         s = pattern.sub(repl, s)
+    s = s.strip().lstrip(".،,؛;: ")
     s = re.sub(r"\s*[،,]\s*", "، ", s)
     s = re.sub(r"\s+([؛;:.!?؟])", r"\1", s)
     s = re.sub(r"([\(\[«])\s+", r"\1", s)
@@ -955,7 +1505,7 @@ def ground_programs(programs, document: str):
 
         grounded.append(item)
 
-    log.info("grounding v8.3: structured=%s kept=%d dropped=%d nulled_fields=%d",
+    log.info("grounding v8.4: structured=%s kept=%d dropped=%d nulled_fields=%d",
              structured, len(grounded), dropped, nulled)
     return grounded, {
         "grounded_kept": len(grounded),
